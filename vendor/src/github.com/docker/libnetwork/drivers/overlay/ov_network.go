@@ -63,6 +63,7 @@ type network struct {
 	initErr   error
 	subnets   []*subnet
 	secure    bool
+	mtu       int
 	sync.Mutex
 }
 
@@ -111,8 +112,17 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 				vnis = append(vnis, uint32(vni))
 			}
 		}
-		if _, ok := optMap["secure"]; ok {
+		if _, ok := optMap[secureOption]; ok {
 			n.secure = true
+		}
+		if val, ok := optMap[netlabel.DriverMTU]; ok {
+			var err error
+			if n.mtu, err = strconv.Atoi(val); err != nil {
+				return fmt.Errorf("failed to parse %v: %v", val, err)
+			}
+			if n.mtu < 0 {
+				return fmt.Errorf("invalid MTU value: %v", n.mtu)
+			}
 		}
 	}
 
@@ -140,6 +150,13 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 		return fmt.Errorf("failed to update data store for network %v: %v", n.id, err)
 	}
 
+	// Make sure no rule is on the way from any stale secure network
+	if !n.secure {
+		for _, vni := range vnis {
+			programMangle(vni, false)
+		}
+	}
+
 	if nInfo != nil {
 		if err := nInfo.TableEventRegister(ovPeerTable); err != nil {
 			return err
@@ -165,6 +182,18 @@ func (d *driver) DeleteNetwork(nid string) error {
 		return fmt.Errorf("could not find network with id %s", nid)
 	}
 
+	for _, ep := range n.endpoints {
+		if ep.ifName != "" {
+			if link, err := ns.NlHandle().LinkByName(ep.ifName); err != nil {
+				ns.NlHandle().LinkDel(link)
+			}
+		}
+
+		if err := d.deleteEndpointFromStore(ep); err != nil {
+			logrus.Warnf("Failed to delete overlay endpoint %s from local store: %v", ep.id[0:7], err)
+		}
+
+	}
 	d.deleteNetwork(nid)
 
 	vnis, err := n.releaseVxlanID()
@@ -284,7 +313,7 @@ func populateVNITbl() {
 			}
 			defer ns.Close()
 
-			nlh, err := netlink.NewHandleAt(ns)
+			nlh, err := netlink.NewHandleAt(ns, syscall.NETLINK_ROUTE)
 			if err != nil {
 				logrus.Errorf("Could not open netlink handle during vni population for ns %s: %v", path, err)
 				return nil
@@ -315,7 +344,7 @@ func networkOnceInit() {
 		return
 	}
 
-	err := createVxlan("testvxlan", 1)
+	err := createVxlan("testvxlan", 1, 0)
 	if err != nil {
 		logrus.Errorf("Failed to create testvxlan interface: %v", err)
 		return
@@ -459,7 +488,7 @@ func (n *network) setupSubnetSandbox(s *subnet, brName, vxlanName string) error 
 		return fmt.Errorf("bridge creation in sandbox failed for subnet %q: %v", s.subnetIP.String(), err)
 	}
 
-	err := createVxlan(vxlanName, n.vxlanID(s))
+	err := createVxlan(vxlanName, n.vxlanID(s), n.maxMTU())
 	if err != nil {
 		return err
 	}
@@ -483,9 +512,13 @@ func (n *network) initSubnetSandbox(s *subnet, restore bool) error {
 	vxlanName := n.generateVxlanName(s)
 
 	if restore {
-		n.restoreSubnetSandbox(s, brName, vxlanName)
+		if err := n.restoreSubnetSandbox(s, brName, vxlanName); err != nil {
+			return err
+		}
 	} else {
-		n.setupSubnetSandbox(s, brName, vxlanName)
+		if err := n.setupSubnetSandbox(s, brName, vxlanName); err != nil {
+			return err
+		}
 	}
 
 	n.Lock()
@@ -620,6 +653,10 @@ func (n *network) watchMiss(nlSock *nl.NetlinkSocket) {
 				continue
 			}
 
+			if !n.driver.isSerfAlive() {
+				continue
+			}
+
 			mac, IPmask, vtep, err := n.driver.resolvePeer(n.id, neigh.IP)
 			if err != nil {
 				logrus.Errorf("could not resolve peer %q: %v", neigh.IP, err)
@@ -647,17 +684,17 @@ func (d *driver) deleteNetwork(nid string) {
 
 func (d *driver) network(nid string) *network {
 	d.Lock()
-	networks := d.networks
+	n, ok := d.networks[nid]
 	d.Unlock()
-
-	n, ok := networks[nid]
 	if !ok {
 		n = d.getNetworkFromStore(nid)
 		if n != nil {
 			n.driver = d
 			n.endpoints = endpointTable{}
 			n.once = &sync.Once{}
-			networks[nid] = n
+			d.Lock()
+			d.networks[nid] = n
+			d.Unlock()
 		}
 	}
 
@@ -732,6 +769,7 @@ func (n *network) Value() []byte {
 
 	m["secure"] = n.secure
 	m["subnets"] = netJSON
+	m["mtu"] = n.mtu
 	b, err = json.Marshal(m)
 	if err != nil {
 		return []byte{}
@@ -780,6 +818,9 @@ func (n *network) SetValue(value []byte) error {
 	if isMap {
 		if val, ok := m["secure"]; ok {
 			n.secure = val.(bool)
+		}
+		if val, ok := m["mtu"]; ok {
+			n.mtu = int(val.(float64))
 		}
 		bytes, err := json.Marshal(m["subnets"])
 		if err != nil {

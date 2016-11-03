@@ -9,5 +9,5 @@ set -e
 	export BINARY_SHORT_NAME="$DOCKER_DAEMON_BINARY_NAME"
 	export SOURCE_PATH='./cmd/dockerd'
 	source "${MAKEDIR}/.binary"
-	copy_containerd "$DEST" 'hash'
+	copy_binaries "$DEST" 'hash'
 )

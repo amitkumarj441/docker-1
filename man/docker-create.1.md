@@ -17,6 +17,8 @@ docker-create - Create a new container
 [**--cidfile**[=*CIDFILE*]]
 [**--cpu-period**[=*0*]]
 [**--cpu-quota**[=*0*]]
+[**--cpu-rt-period**[=*0*]]
+[**--cpu-rt-runtime**[=*0*]]
 [**--cpuset-cpus**[=*CPUSET-CPUS*]]
 [**--cpuset-mems**[=*CPUSET-MEMS*]]
 [**--device**[=*[]*]]
@@ -51,9 +53,10 @@ docker-create - Create a new container
 [**--memory-reservation**[=*MEMORY-RESERVATION*]]
 [**--memory-swap**[=*LIMIT*]]
 [**--memory-swappiness**[=*MEMORY-SWAPPINESS*]]
+[**--mount**[=*MOUNT*]]
 [**--name**[=*NAME*]]
-[**--net**[=*"bridge"*]]
-[**--net-alias**[=*[]*]]
+[**--network-alias**[=*[]*]]
+[**--network**[=*"bridge"*]]
 [**--oom-kill-disable**]
 [**--oom-score-adj**[=*0*]]
 [**-P**|**--publish-all**]
@@ -64,9 +67,11 @@ docker-create - Create a new container
 [**--privileged**]
 [**--read-only**]
 [**--restart**[=*RESTART*]]
+[**--rm**]
 [**--security-opt**[=*[]*]]
 [**--storage-opt**[=*[]*]]
 [**--stop-signal**[=*SIGNAL*]]
+[**--stop-timeout**[=*TIMEOUT*]]
 [**--shm-size**[=*[]*]]
 [**--sysctl**[=*[]*]]
 [**-t**|**--tty**]
@@ -121,6 +126,8 @@ The initial status of the container created with **docker create** is 'created'.
 **--cpu-period**=*0*
     Limit the CPU CFS (Completely Fair Scheduler) period
 
+    Limit the container's CPU usage. This flag tell the kernel to restrict the container's CPU usage to the period you specify.
+
 **--cpuset-cpus**=""
    CPUs in which to allow execution (0-3, 0,1)
 
@@ -133,6 +140,19 @@ two memory nodes.
 
 **--cpu-quota**=*0*
    Limit the CPU CFS (Completely Fair Scheduler) quota
+
+**--cpu-rt-period**=0
+   Limit the CPU real-time period in microseconds
+
+   Limit the container's Real Time CPU usage. This flag tell the kernel to restrict the container's Real Time CPU usage to the period you specify.
+
+**--cpu-rt-runtime**=0
+   Limit the CPU real-time runtime in microseconds
+
+   Limit the containers Real Time CPU usage. This flag tells the kernel to limit the amount of time in a given CPU period Real Time tasks may consume. Ex:
+   Period of 1,000,000us and Runtime of 950,000us means that this container could consume 95% of available CPU and leave the remaining 5% to normal priority tasks.
+
+   The sum of all runtimes across containers cannot exceed the amount allotted to the parent cgroup.
 
 **--device**=[]
    Add a host device to the container (e.g. --device=/dev/sdc:/dev/xvdc:rwm)
@@ -225,7 +245,7 @@ millions of trillions.
    Add one or more link-local IPv4/IPv6 addresses to the container's interface
 
 **--log-driver**="*json-file*|*syslog*|*journald*|*gelf*|*fluentd*|*awslogs*|*splunk*|*etwlogs*|*gcplogs*|*none*"
-  Logging driver for container. Default is defined by daemon `--log-driver` flag.
+  Logging driver for the container. Default is defined by daemon `--log-driver` flag.
   **Warning**: the `docker logs` command works only for the `json-file` and
   `journald` logging drivers.
 
@@ -276,7 +296,7 @@ unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
                                'host': use the Docker host network stack.  Note: the host mode gives the container full access to local system services such as D-bus and is therefore considered insecure.
                                '<network-name>|<network-id>': connect to a user-defined network
 
-**--net-alias**=[]
+**--network-alias**=[]
    Add network-scoped alias for the container
 
 **--oom-kill-disable**=*true*|*false*
@@ -317,6 +337,9 @@ unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
 **--restart**="*no*"
    Restart policy to apply when a container exits (no, on-failure[:max-retry], always, unless-stopped).
 
+**--rm**=*true*|*false*
+   Automatically remove the container when it exits. The default is *false*.
+
 **--shm-size**=""
    Size of `/dev/shm`. The format is `<number><unit>`. `number` must be greater than `0`.
    Unit is optional and can be `b` (bytes), `k` (kilobytes), `m` (megabytes), or `g` (gigabytes). If you omit the unit, the system uses bytes.
@@ -339,11 +362,17 @@ unit, `b` is used. Set LIMIT to `-1` to enable unlimited swap.
 
    $ docker create -it --storage-opt size=120G fedora /bin/bash
 
-   This (size) will allow to set the container rootfs size to 120G at creation time. User cannot pass a size less than the Default BaseFS Size.
-   This option is only available for the `devicemapper`, `btrfs` and `zfs` graphrivers.
+   This (size) will allow to set the container rootfs size to 120G at creation time.
+   This option is only available for the `devicemapper`, `btrfs`, `overlay2` and `zfs` graph drivers.
+   For the `devicemapper`, `btrfs` and `zfs` storage drivers, user cannot pass a size less than the Default BaseFS Size.
+   For the `overlay2` storage driver, the size option is only available if the backing fs is `xfs` and mounted with the `pquota` mount option.
+   Under these conditions, user can pass any size less then the backing fs size.
   
 **--stop-signal**=*SIGTERM*
   Signal to stop a container. Default is SIGTERM.
+
+**--stop-timeout**=*10*
+  Timeout (in seconds) to stop a container. Default is 10.
 
 **--sysctl**=SYSCTL
   Configure namespaced kernel parameters at runtime
@@ -375,7 +404,12 @@ any options, the systems uses the following options:
 `rw,noexec,nosuid,nodev,size=65536k`.
 
 **-u**, **--user**=""
-   Username or UID
+   Sets the username or UID used and optionally the groupname or GID for the specified command.
+
+   The followings examples are all valid:
+   --user [user | user:group | uid | uid:gid | user:gid | uid:group ]
+
+   Without this argument root user will be used in the container by default.
 
 **--ulimit**=[]
    Ulimit options

@@ -8,15 +8,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	cfcsr "github.com/cloudflare/cfssl/csr"
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/initca"
@@ -28,7 +25,8 @@ import (
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/identity"
 	"github.com/docker/swarmkit/ioutils"
-	"github.com/docker/swarmkit/picker"
+	"github.com/docker/swarmkit/remotes"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -37,13 +35,14 @@ import (
 const (
 	// Security Strength Equivalence
 	//-----------------------------------
-	//| Key-type |  ECC  |  DH/DSA/RSA  |
-	//|   Node   |  256  |     3072     |
-	//|   Root   |  384  |     7680     |
+	//| ECC  |  DH/DSA/RSA  |
+	//| 256  |     3072     |
+	//| 384  |     7680     |
 	//-----------------------------------
 
 	// RootKeySize is the default size of the root CA key
-	RootKeySize = 384
+	// It would be ideal for the root key to use P-384, but in P-384 is not optimized in go yet :(
+	RootKeySize = 256
 	// RootKeyAlgo defines the default algorithm for the root CA Key
 	RootKeyAlgo = "ecdsa"
 	// PassphraseENVVar defines the environment variable to look for the
@@ -57,20 +56,28 @@ const (
 	RootCAExpiration = "630720000s"
 	// DefaultNodeCertExpiration represents the default expiration for node certificates (3 months)
 	DefaultNodeCertExpiration = 2160 * time.Hour
+	// CertBackdate represents the amount of time each certificate is backdated to try to avoid
+	// clock drift issues.
+	CertBackdate = 1 * time.Hour
 	// CertLowerRotationRange represents the minimum fraction of time that we will wait when randomly
 	// choosing our next certificate rotation
 	CertLowerRotationRange = 0.5
 	// CertUpperRotationRange represents the maximum fraction of time that we will wait when randomly
 	// choosing our next certificate rotation
 	CertUpperRotationRange = 0.8
-	// MinNodeCertExpiration represents the minimum expiration for node certificates (25 + 5 minutes)
-	// X - 5 > CertUpperRotationRange * X <=> X < 5/(1 - CertUpperRotationRange)
-	// Since we're issuing certificates 5 minutes in the past to get around clock drifts, and
-	// we're selecting a random rotation distribution range from CertLowerRotationRange to
-	// CertUpperRotationRange, we need to ensure that we don't accept an expiration time that will
-	// make a node able to randomly choose the next rotation after the expiration of the certificate.
-	MinNodeCertExpiration = 30 * time.Minute
+	// MinNodeCertExpiration represents the minimum expiration for node certificates
+	MinNodeCertExpiration = 1 * time.Hour
 )
+
+// A recoverableErr is an non-fatal error encountered signing a certificate,
+// which means that the certificate issuance may be retried at a later time.
+type recoverableErr struct {
+	err error
+}
+
+func (r recoverableErr) Error() string {
+	return r.err.Error()
+}
 
 // ErrNoLocalRootCA is an error type used to indicate that the local root CA
 // certificate file does not exist.
@@ -78,7 +85,7 @@ var ErrNoLocalRootCA = errors.New("local root CA certificate does not exist")
 
 // ErrNoValidSigner is an error type used to indicate that our RootCA doesn't have the ability to
 // sign certificates.
-var ErrNoValidSigner = errors.New("no valid signer found")
+var ErrNoValidSigner = recoverableErr{err: errors.New("no valid signer found")}
 
 func init() {
 	cflog.Level = 5
@@ -118,8 +125,7 @@ func (rca *RootCA) CanSign() bool {
 func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org string) (*tls.Certificate, error) {
 	csr, key, err := GenerateAndWriteNewKey(paths)
 	if err != nil {
-		log.Debugf("error when generating new node certs: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "error when generating new node certs")
 	}
 
 	if !rca.CanSign() {
@@ -129,8 +135,7 @@ func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org stri
 	// Obtain a signed Certificate
 	certChain, err := rca.ParseValidateAndSignCSR(csr, cn, ou, org)
 	if err != nil {
-		log.Debugf("failed to sign node certificate: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to sign node certificate")
 	}
 
 	// Ensure directory exists
@@ -150,24 +155,30 @@ func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org stri
 		return nil, err
 	}
 
-	log.Debugf("locally issued new TLS certificate for node ID: %s and role: %s", cn, ou)
 	return &tlsKeyPair, nil
 }
 
 // RequestAndSaveNewCertificates gets new certificates issued, either by signing them locally if a signer is
 // available, or by requesting them from the remote server at remoteAddr.
-func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths CertPaths, role, secret string, picker *picker.Picker, transport credentials.TransportAuthenticator, nodeInfo chan<- api.IssueNodeCertificateResponse) (*tls.Certificate, error) {
+func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths CertPaths, token string, remotes remotes.Remotes, transport credentials.TransportCredentials, nodeInfo chan<- api.IssueNodeCertificateResponse) (*tls.Certificate, error) {
 	// Create a new key/pair and CSR for the new manager
 	// Write the new CSR and the new key to a temporary location so we can survive crashes on rotation
 	tempPaths := genTempPaths(paths)
 	csr, key, err := GenerateAndWriteNewKey(tempPaths)
 	if err != nil {
-		log.Debugf("error when generating new node certs: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "error when generating new node certs")
 	}
 
 	// Get the remote manager to issue a CA signed certificate for this node
-	signedCert, err := GetRemoteSignedCertificate(ctx, csr, role, secret, rca.Pool, picker, transport, nodeInfo)
+	// Retry up to 5 times in case the manager we first try to contact isn't
+	// responding properly (for example, it may have just been demoted).
+	var signedCert []byte
+	for i := 0; i != 5; i++ {
+		signedCert, err = GetRemoteSignedCertificate(ctx, csr, token, rca.Pool, remotes, transport, nodeInfo)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +188,7 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 	// Create an X509Cert so we can .Verify()
 	certBlock, _ := pem.Decode(signedCert)
 	if certBlock == nil {
-		return nil, fmt.Errorf("failed to parse certificate PEM")
+		return nil, errors.New("failed to parse certificate PEM")
 	}
 	X509Cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
@@ -192,7 +203,11 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 		return nil, err
 	}
 
-	log.Infof("Downloaded new TLS credentials with role: %s.", role)
+	// Create a valid TLSKeyPair out of the PEM encoded private key and certificate
+	tlsKeyPair, err := tls.X509KeyPair(signedCert, key)
+	if err != nil {
+		return nil, err
+	}
 
 	// Ensure directory exists
 	err = os.MkdirAll(filepath.Dir(paths.Cert), 0755)
@@ -210,13 +225,27 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 		return nil, err
 	}
 
-	// Create a valid TLSKeyPair out of the PEM encoded private key and certificate
-	tlsKeyPair, err := tls.X509KeyPair(signedCert, key)
-	if err != nil {
-		return nil, err
+	return &tlsKeyPair, nil
+}
+
+// PrepareCSR creates a CFSSL Sign Request based on the given raw CSR and
+// overrides the Subject and Hosts with the given extra args.
+func PrepareCSR(csrBytes []byte, cn, ou, org string) cfsigner.SignRequest {
+	// All managers get added the subject-alt-name of CA, so they can be
+	// used for cert issuance.
+	hosts := []string{ou, cn}
+	if ou == ManagerRole {
+		hosts = append(hosts, CARole)
 	}
 
-	return &tlsKeyPair, nil
+	return cfsigner.SignRequest{
+		Request: string(csrBytes),
+		// OU is used for Authentication of the node type. The CN has the random
+		// node ID.
+		Subject: &cfsigner.Subject{CN: cn, Names: []cfcsr.Name{{OU: ou, O: org}}},
+		// Adding ou as DNS alt name, so clients can connect to ManagerRole and CARole
+		Hosts: hosts,
+	}
 }
 
 // ParseValidateAndSignCSR returns a signed certificate from a particular rootCA and a CSR.
@@ -225,25 +254,20 @@ func (rca *RootCA) ParseValidateAndSignCSR(csrBytes []byte, cn, ou, org string) 
 		return nil, ErrNoValidSigner
 	}
 
-	// All managers get added the subject-alt-name of CA, so they can be used for cert issuance
-	hosts := []string{ou}
-	if ou == ManagerRole {
-		hosts = append(hosts, CARole)
-	}
+	signRequest := PrepareCSR(csrBytes, cn, ou, org)
 
-	cert, err := rca.Signer.Sign(cfsigner.SignRequest{
-		Request: string(csrBytes),
-		// OU is used for Authentication of the node type. The CN has the random
-		// node ID.
-		Subject: &cfsigner.Subject{CN: cn, Names: []cfcsr.Name{{OU: ou, O: org}}},
-		// Adding ou as DNS alt name, so clients can connect to ManagerRole and CARole
-		Hosts: hosts,
-	})
+	cert, err := rca.Signer.Sign(signRequest)
 	if err != nil {
-		log.Debugf("failed to sign node certificate: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to sign node certificate")
 	}
 
+	return rca.AppendFirstRootPEM(cert)
+}
+
+// AppendFirstRootPEM appends the first certificate from this RootCA's cert
+// bundle to the given cert bundle (which should already be encoded as a series
+// of PEM-encoded certificate blocks).
+func (rca *RootCA) AppendFirstRootPEM(cert []byte) ([]byte, error) {
 	// Append the first root CA Cert to the certificate, to create a valid chain
 	// Get the first Root CA Cert on the bundle
 	firstRootCA, _, err := helpers.ParseOneCertificateFromPEM(rca.Cert)
@@ -251,12 +275,12 @@ func (rca *RootCA) ParseValidateAndSignCSR(csrBytes []byte, cn, ou, org string) 
 		return nil, err
 	}
 	if len(firstRootCA) < 1 {
-		return nil, fmt.Errorf("no valid Root CA certificates found")
+		return nil, errors.New("no valid Root CA certificates found")
 	}
 	// Convert the first root CA back to PEM
 	firstRootCAPEM := helpers.EncodeCertificatePEM(firstRootCA[0])
 	if firstRootCAPEM == nil {
-		return nil, fmt.Errorf("error while encoding the Root CA certificate")
+		return nil, errors.New("error while encoding the Root CA certificate")
 	}
 	// Append this Root CA to the certificate to make [Cert PEM]\n[Root PEM][EOF]
 	certChain := append(cert, firstRootCAPEM...)
@@ -275,7 +299,7 @@ func NewRootCA(certBytes, keyBytes []byte, certExpiry time.Duration) (RootCA, er
 	}
 	// Check to see if we have at least one valid cert
 	if len(parsedCerts) < 1 {
-		return RootCA{}, fmt.Errorf("no valid Root CA certificates found")
+		return RootCA{}, errors.New("no valid Root CA certificates found")
 	}
 
 	// Create a Pool with all of the certificates found
@@ -283,7 +307,7 @@ func NewRootCA(certBytes, keyBytes []byte, certExpiry time.Duration) (RootCA, er
 	for _, cert := range parsedCerts {
 		// Check to see if all of the certificates are valid, self-signed root CA certs
 		if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
-			return RootCA{}, fmt.Errorf("error while validating Root CA Certificate: %v", err)
+			return RootCA{}, errors.Wrap(err, "error while validating Root CA Certificate")
 		}
 		pool.AddCert(cert)
 	}
@@ -316,8 +340,7 @@ func NewRootCA(certBytes, keyBytes []byte, certExpiry time.Duration) (RootCA, er
 	if err != nil {
 		priv, err = helpers.ParsePrivateKeyPEMWithPassword(keyBytes, passphrasePrev)
 		if err != nil {
-			log.Debug("Malformed private key %v", err)
-			return RootCA{}, err
+			return RootCA{}, errors.Wrap(err, "malformed private key")
 		}
 	}
 
@@ -357,10 +380,10 @@ func ensureCertKeyMatch(cert *x509.Certificate, key crypto.PublicKey) error {
 			return nil
 		}
 	default:
-		return fmt.Errorf("unknown or unsupported certificate public key algorithm")
+		return errors.New("unknown or unsupported certificate public key algorithm")
 	}
 
-	return fmt.Errorf("certificate key mismatch")
+	return errors.New("certificate key mismatch")
 }
 
 // GetLocalRootCA validates if the contents of the file are a valid self-signed
@@ -388,42 +411,42 @@ func GetLocalRootCA(baseDir string) (RootCA, error) {
 		key = nil
 	}
 
-	rootCA, err := NewRootCA(cert, key, DefaultNodeCertExpiration)
-	if err == nil {
-		log.Debugf("successfully loaded the signer for the Root CA: %s", paths.RootCA.Cert)
-	}
-
-	return rootCA, err
+	return NewRootCA(cert, key, DefaultNodeCertExpiration)
 }
 
 // GetRemoteCA returns the remote endpoint's CA certificate
-func GetRemoteCA(ctx context.Context, d digest.Digest, picker *picker.Picker) (RootCA, error) {
-	// We need a valid picker to be able to Dial to a remote CA
-	if picker == nil {
-		return RootCA{}, fmt.Errorf("valid remote address picker required")
-	}
-
+func GetRemoteCA(ctx context.Context, d digest.Digest, r remotes.Remotes) (RootCA, error) {
 	// This TLS Config is intentionally using InsecureSkipVerify. Either we're
 	// doing TOFU, in which case we don't validate the remote CA, or we're using
 	// a user supplied hash to check the integrity of the CA certificate.
 	insecureCreds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecureCreds),
-		grpc.WithBackoffMaxDelay(10 * time.Second),
-		grpc.WithPicker(picker)}
+		grpc.WithTimeout(5 * time.Second),
+		grpc.WithBackoffMaxDelay(5 * time.Second),
+	}
 
-	firstAddr, err := picker.PickAddr()
+	peer, err := r.Select()
 	if err != nil {
 		return RootCA{}, err
 	}
 
-	conn, err := grpc.Dial(firstAddr, opts...)
+	conn, err := grpc.Dial(peer.Addr, opts...)
 	if err != nil {
 		return RootCA{}, err
 	}
 	defer conn.Close()
 
 	client := api.NewCAClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	defer func() {
+		if err != nil {
+			r.Observe(peer, -remotes.DefaultObservationWeight)
+			return
+		}
+		r.Observe(peer, remotes.DefaultObservationWeight)
+	}()
 	response, err := client.GetRootCACertificate(ctx, &api.GetRootCACertificateRequest{})
 	if err != nil {
 		return RootCA{}, err
@@ -432,13 +455,13 @@ func GetRemoteCA(ctx context.Context, d digest.Digest, picker *picker.Picker) (R
 	if d != "" {
 		verifier, err := digest.NewDigestVerifier(d)
 		if err != nil {
-			return RootCA{}, fmt.Errorf("unexpected error getting digest verifier: %v", err)
+			return RootCA{}, errors.Wrap(err, "unexpected error getting digest verifier")
 		}
 
 		io.Copy(verifier, bytes.NewReader(response.Certificate))
 
 		if !verifier.Verified() {
-			return RootCA{}, fmt.Errorf("remote CA does not match fingerprint. Expected: %s", d.Hex())
+			return RootCA{}, errors.Errorf("remote CA does not match fingerprint. Expected: %s", d.Hex())
 
 		}
 	}
@@ -452,10 +475,10 @@ func GetRemoteCA(ctx context.Context, d digest.Digest, picker *picker.Picker) (R
 	// Create a Pool with our RootCACertificate
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(response.Certificate) {
-		return RootCA{}, fmt.Errorf("failed to append certificate to cert pool")
+		return RootCA{}, errors.New("failed to append certificate to cert pool")
 	}
 
-	return RootCA{Cert: response.Certificate, Pool: pool}, nil
+	return RootCA{Cert: response.Certificate, Digest: digest.FromBytes(response.Certificate), Pool: pool}, nil
 }
 
 // CreateAndWriteRootCA creates a Certificate authority for a new Swarm Cluster, potentially
@@ -521,8 +544,7 @@ func GenerateAndSignNewTLSCert(rootCA RootCA, cn, ou, org string, paths CertPath
 	// Obtain a signed Certificate
 	certChain, err := rootCA.ParseValidateAndSignCSR(csr, cn, ou, org)
 	if err != nil {
-		log.Debugf("failed to sign node certificate: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "failed to sign node certificate")
 	}
 
 	// Ensure directory exists
@@ -570,14 +592,11 @@ func GenerateAndWriteNewKey(paths CertPaths) (csr, key []byte, err error) {
 	return
 }
 
-// GetRemoteSignedCertificate submits a CSR together with the intended role to a remote CA server address
-// available through a picker, and that is part of a CA identified by a specific certificate pool.
-func GetRemoteSignedCertificate(ctx context.Context, csr []byte, role, secret string, rootCAPool *x509.CertPool, picker *picker.Picker, creds credentials.TransportAuthenticator, nodeInfo chan<- api.IssueNodeCertificateResponse) ([]byte, error) {
+// GetRemoteSignedCertificate submits a CSR to a remote CA server address,
+// and that is part of a CA identified by a specific certificate pool.
+func GetRemoteSignedCertificate(ctx context.Context, csr []byte, token string, rootCAPool *x509.CertPool, r remotes.Remotes, creds credentials.TransportCredentials, nodeInfo chan<- api.IssueNodeCertificateResponse) ([]byte, error) {
 	if rootCAPool == nil {
-		return nil, fmt.Errorf("valid root CA pool required")
-	}
-	if picker == nil {
-		return nil, fmt.Errorf("valid remote address picker required")
+		return nil, errors.New("valid root CA pool required")
 	}
 
 	if creds == nil {
@@ -586,35 +605,31 @@ func GetRemoteSignedCertificate(ctx context.Context, csr []byte, role, secret st
 		creds = credentials.NewTLS(&tls.Config{ServerName: CARole, RootCAs: rootCAPool})
 	}
 
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
-		grpc.WithBackoffMaxDelay(10 * time.Second),
-		grpc.WithPicker(picker)}
-
-	firstAddr, err := picker.PickAddr()
+	peer, err := r.Select()
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(firstAddr, opts...)
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithTimeout(5 * time.Second),
+		grpc.WithBackoffMaxDelay(5 * time.Second),
+	}
+
+	conn, err := grpc.Dial(peer.Addr, opts...)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 
-	// Create a CAClient to retreive a new Certificate
+	// Create a CAClient to retrieve a new Certificate
 	caClient := api.NewNodeCAClient(conn)
 
-	// Convert our internal string roles into an API role
-	apiRole, err := FormatRole(role)
-	if err != nil {
-		return nil, err
-	}
-
 	// Send the Request and retrieve the request token
-	issueRequest := &api.IssueNodeCertificateRequest{CSR: csr, Role: apiRole, Secret: secret}
+	issueRequest := &api.IssueNodeCertificateRequest{CSR: csr, Token: token}
 	issueResponse, err := caClient.IssueNodeCertificate(ctx, issueRequest)
 	if err != nil {
+		r.Observe(peer, -remotes.DefaultObservationWeight)
 		return nil, err
 	}
 
@@ -630,21 +645,32 @@ func GetRemoteSignedCertificate(ctx context.Context, csr []byte, role, secret st
 		Max:    30 * time.Second,
 	})
 
-	log.Infof("Waiting for TLS certificate to be issued...")
 	// Exponential backoff with Max of 30 seconds to wait for a new retry
 	for {
 		// Send the Request and retrieve the certificate
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
 		statusResponse, err := caClient.NodeCertificateStatus(ctx, statusRequest)
 		if err != nil {
+			r.Observe(peer, -remotes.DefaultObservationWeight)
 			return nil, err
 		}
 
 		// If the certificate was issued, return
 		if statusResponse.Status.State == api.IssuanceStateIssued {
 			if statusResponse.Certificate == nil {
-				return nil, fmt.Errorf("no certificate in CertificateStatus response")
+				return nil, errors.New("no certificate in CertificateStatus response")
 			}
-			return statusResponse.Certificate.Certificate, nil
+
+			// The certificate in the response must match the CSR
+			// we submitted. If we are getting a response for a
+			// certificate that was previously issued, we need to
+			// retry until the certificate gets updated per our
+			// current request.
+			if bytes.Equal(statusResponse.Certificate.CSR, csr) {
+				r.Observe(peer, remotes.DefaultObservationWeight)
+				return statusResponse.Certificate.Certificate, nil
+			}
 		}
 
 		// If we're still pending, the issuance failed, or the state is unknown
@@ -654,26 +680,26 @@ func GetRemoteSignedCertificate(ctx context.Context, csr []byte, role, secret st
 	}
 }
 
-// readCertExpiration returns the number of months left for certificate expiration
-func readCertExpiration(paths CertPaths) (time.Duration, error) {
+// readCertValidity returns the certificate issue and expiration time
+func readCertValidity(paths CertPaths) (time.Time, time.Time, error) {
+	var zeroTime time.Time
 	// Read the Cert
 	cert, err := ioutil.ReadFile(paths.Cert)
 	if err != nil {
-		log.Debugf("failed to read certificate file: %s", paths.Cert)
-		return time.Hour, err
+		return zeroTime, zeroTime, err
 	}
 
 	// Create an x509 certificate out of the contents on disk
-	certBlock, _ := pem.Decode([]byte(cert))
+	certBlock, _ := pem.Decode(cert)
 	if certBlock == nil {
-		return time.Hour, fmt.Errorf("failed to decode certificate block")
+		return zeroTime, zeroTime, errors.New("failed to decode certificate block")
 	}
 	X509Cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
-		return time.Hour, err
+		return zeroTime, zeroTime, err
 	}
 
-	return X509Cert.NotAfter.Sub(time.Now()), nil
+	return X509Cert.NotBefore, X509Cert.NotAfter, nil
 
 }
 
@@ -695,7 +721,6 @@ func generateNewCSR() (csr, key []byte, err error) {
 
 	csr, key, err = cfcsr.ParseRequest(req)
 	if err != nil {
-		log.Debugf(`failed to generate CSR`)
 		return
 	}
 
@@ -712,7 +737,7 @@ func EncryptECPrivateKey(key []byte, passphraseStr string) ([]byte, error) {
 	keyBlock, _ := pem.Decode(key)
 	if keyBlock == nil {
 		// This RootCA does not have a valid signer.
-		return nil, fmt.Errorf("error while decoding PEM key")
+		return nil, errors.New("error while decoding PEM key")
 	}
 
 	encryptedPEMBlock, err := x509.EncryptPEMBlock(rand.Reader,
@@ -725,7 +750,7 @@ func EncryptECPrivateKey(key []byte, passphraseStr string) ([]byte, error) {
 	}
 
 	if encryptedPEMBlock.Headers == nil {
-		return nil, fmt.Errorf("unable to encrypt key - invalid PEM file produced")
+		return nil, errors.New("unable to encrypt key - invalid PEM file produced")
 	}
 
 	return pem.EncodeToMemory(encryptedPEMBlock), nil

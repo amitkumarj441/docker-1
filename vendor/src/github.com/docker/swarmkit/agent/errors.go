@@ -11,9 +11,8 @@ var (
 
 	errNodeNotRegistered = fmt.Errorf("node not registered")
 
-	errAgentNotStarted = errors.New("agent: not started")
 	errAgentStarted    = errors.New("agent: already started")
-	errAgentStopped    = errors.New("agent: stopped")
+	errAgentNotStarted = errors.New("agent: not started")
 
 	errTaskNoContoller          = errors.New("agent: no task controller")
 	errTaskNotAssigned          = errors.New("agent: task not assigned")

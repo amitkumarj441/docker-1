@@ -1,34 +1,38 @@
-<!--[metadata]>
-+++
-title = "swarm update"
-description = "The swarm update command description and usage"
-keywords = ["swarm, update"]
-[menu.main]
-parent = "smn_cli"
-+++
-<![end-metadata]-->
+---
+title: "swarm update"
+description: "The swarm update command description and usage"
+keywords: ["swarm, update"]
+---
 
-**Warning:** this command is part of the Swarm management feature introduced in Docker 1.12, and might be subject to non backward-compatible changes.
+<!-- This file is maintained within the docker/docker Github
+     repository at https://github.com/docker/docker/. Make all
+     pull requests against that repo. If you see this file in
+     another repository, consider it read-only there, as it will
+     periodically be overwritten by the definitive file. Pull
+     requests which include edits to this file in other repositories
+     will be rejected.
+-->
 
 # swarm update
 
-    Usage:  docker swarm update [OPTIONS]
-    
-    update the Swarm.
-    
-    Options:
-          --auto-accept value               Auto acceptance policy (worker, manager or none)
-          --dispatcher-heartbeat duration   Dispatcher heartbeat period (default 5s)
-          --help                            Print usage
-          --secret string                   Set secret value needed to accept nodes into cluster
-          --task-history-limit int          Task history retention limit (default 10)
-          --cert-expiry duration            Validity period for node certificates (default 2160h0m0s)
+```markdown
+Usage:  docker swarm update [OPTIONS]
 
-Updates a Swarm cluster with new parameter values. This command must target a manager node.
+Update the swarm
+
+Options:
+      --cert-expiry duration            Validity period for node certificates (default 2160h0m0s)
+      --dispatcher-heartbeat duration   Dispatcher heartbeat period (default 5s)
+      --external-ca value               Specifications of one or more certificate signing endpoints
+      --help                            Print usage
+      --task-history-limit int          Task history retention limit (default 5)
+```
+
+Updates a swarm with new parameter values. This command must target a manager node.
 
 
 ```bash
-$ docker swarm update --auto-accept manager
+$ docker swarm update --cert-expiry 720h
 ```
 
 ## Related information
@@ -36,4 +40,3 @@ $ docker swarm update --auto-accept manager
 * [swarm init](swarm_init.md)
 * [swarm join](swarm_join.md)
 * [swarm leave](swarm_leave.md)
-

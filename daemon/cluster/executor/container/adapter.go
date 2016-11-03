@@ -7,14 +7,20 @@ import (
 	"io"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/server/httputils"
+	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/versions"
 	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	"github.com/docker/engine-api/types"
 	"github.com/docker/libnetwork"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
 	"golang.org/x/net/context"
+	"golang.org/x/time/rate"
 )
 
 // containerAdapter conducts remote operations for a container. All calls
@@ -44,7 +50,6 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 	var encodedAuthConfig string
 	if spec.PullOptions != nil {
 		encodedAuthConfig = spec.PullOptions.RegistryAuth
-
 	}
 
 	authConfig := &types.AuthConfig{}
@@ -62,7 +67,11 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 	}()
 
 	dec := json.NewDecoder(pr)
+	dec.UseNumber()
 	m := map[string]interface{}{}
+	spamLimiter := rate.NewLimiter(rate.Every(time.Second), 1)
+
+	lastStatus := ""
 	for {
 		if err := dec.Decode(&m); err != nil {
 			if err == io.EOF {
@@ -70,9 +79,32 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 			}
 			return err
 		}
-		// TOOD(stevvooe): Report this status somewhere.
-		logrus.Debugln("pull progress", m)
+		l := log.G(ctx)
+		// limit pull progress logs unless the status changes
+		if spamLimiter.Allow() || lastStatus != m["status"] {
+			// if we have progress details, we have everything we need
+			if progress, ok := m["progressDetail"].(map[string]interface{}); ok {
+				// first, log the image and status
+				l = l.WithFields(logrus.Fields{
+					"image":  c.container.image(),
+					"status": m["status"],
+				})
+				// then, if we have progress, log the progress
+				if progress["current"] != nil && progress["total"] != nil {
+					l = l.WithFields(logrus.Fields{
+						"current": progress["current"],
+						"total":   progress["total"],
+					})
+				}
+			}
+			l.Debug("pull in progress")
+		}
+		// sometimes, we get no useful information at all, and add no fields
+		if status, ok := m["status"].(string); ok {
+			lastStatus = status
+		}
 	}
+
 	// if the final stream object contained an error, return it
 	if errMsg, ok := m["error"]; ok {
 		return fmt.Errorf("%v", errMsg)
@@ -102,43 +134,88 @@ func (c *containerAdapter) createNetworks(ctx context.Context) error {
 func (c *containerAdapter) removeNetworks(ctx context.Context) error {
 	for _, nid := range c.container.networks() {
 		if err := c.backend.DeleteManagedNetwork(nid); err != nil {
-			if _, ok := err.(*libnetwork.ActiveEndpointsError); ok {
+			switch err.(type) {
+			case *libnetwork.ActiveEndpointsError:
 				continue
+			case libnetwork.ErrNoSuchNetwork:
+				continue
+			default:
+				log.G(ctx).Errorf("network %s remove failed: %v", nid, err)
+				return err
 			}
-			log.G(ctx).Errorf("network %s remove failed: %v", nid, err)
-			return err
 		}
 	}
 
 	return nil
 }
 
-func (c *containerAdapter) create(ctx context.Context, backend executorpkg.Backend) error {
-	var cr types.ContainerCreateResponse
+func (c *containerAdapter) networkAttach(ctx context.Context) error {
+	config := c.container.createNetworkingConfig()
+
+	var (
+		networkName string
+		networkID   string
+	)
+
+	if config != nil {
+		for n, epConfig := range config.EndpointsConfig {
+			networkName = n
+			networkID = epConfig.NetworkID
+			break
+		}
+	}
+
+	return c.backend.UpdateAttachment(networkName, networkID, c.container.id(), config)
+}
+
+func (c *containerAdapter) waitForDetach(ctx context.Context) error {
+	config := c.container.createNetworkingConfig()
+
+	var (
+		networkName string
+		networkID   string
+	)
+
+	if config != nil {
+		for n, epConfig := range config.EndpointsConfig {
+			networkName = n
+			networkID = epConfig.NetworkID
+			break
+		}
+	}
+
+	return c.backend.WaitForDetachment(ctx, networkName, networkID, c.container.taskID(), c.container.id())
+}
+
+func (c *containerAdapter) create(ctx context.Context) error {
+	var cr containertypes.ContainerCreateCreatedBody
 	var err error
-	if cr, err = backend.CreateManagedContainer(types.ContainerCreateConfig{
+	version := httputils.VersionFromContext(ctx)
+	validateHostname := versions.GreaterThanOrEqualTo(version, "1.24")
+
+	if cr, err = c.backend.CreateManagedContainer(types.ContainerCreateConfig{
 		Name:       c.container.name(),
 		Config:     c.container.config(),
 		HostConfig: c.container.hostConfig(),
 		// Use the first network in container create
 		NetworkingConfig: c.container.createNetworkingConfig(),
-	}); err != nil {
+	}, validateHostname); err != nil {
 		return err
 	}
 
-	// Docker daemon currently doesnt support multiple networks in container create
+	// Docker daemon currently doesn't support multiple networks in container create
 	// Connect to all other networks
 	nc := c.container.connectNetworkingConfig()
 
 	if nc != nil {
 		for n, ep := range nc.EndpointsConfig {
-			if err := backend.ConnectContainerToNetwork(cr.ID, n, ep); err != nil {
+			if err := c.backend.ConnectContainerToNetwork(cr.ID, n, ep); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := backend.UpdateContainerServiceConfig(cr.ID, c.container.serviceConfig()); err != nil {
+	if err := c.backend.UpdateContainerServiceConfig(cr.ID, c.container.serviceConfig()); err != nil {
 		return err
 	}
 
@@ -146,7 +223,9 @@ func (c *containerAdapter) create(ctx context.Context, backend executorpkg.Backe
 }
 
 func (c *containerAdapter) start(ctx context.Context) error {
-	return c.backend.ContainerStart(c.container.name(), nil)
+	version := httputils.VersionFromContext(ctx)
+	validateHostname := versions.GreaterThanOrEqualTo(version, "1.24")
+	return c.backend.ContainerStart(c.container.name(), nil, validateHostname, "", "")
 }
 
 func (c *containerAdapter) inspect(ctx context.Context) (types.ContainerJSON, error) {
@@ -162,19 +241,51 @@ func (c *containerAdapter) inspect(ctx context.Context) (types.ContainerJSON, er
 
 // events issues a call to the events API and returns a channel with all
 // events. The stream of events can be shutdown by cancelling the context.
-//
-// A chan struct{} is returned that will be closed if the event procressing
-// fails and needs to be restarted.
+func (c *containerAdapter) events(ctx context.Context) <-chan events.Message {
+	log.G(ctx).Debugf("waiting on events")
+	buffer, l := c.backend.SubscribeToEvents(time.Time{}, time.Time{}, c.container.eventFilter())
+	eventsq := make(chan events.Message, len(buffer))
+
+	for _, event := range buffer {
+		eventsq <- event
+	}
+
+	go func() {
+		defer c.backend.UnsubscribeFromEvents(l)
+
+		for {
+			select {
+			case ev := <-l:
+				jev, ok := ev.(events.Message)
+				if !ok {
+					log.G(ctx).Warnf("unexpected event message: %q", ev)
+					continue
+				}
+				select {
+				case eventsq <- jev:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return eventsq
+}
+
 func (c *containerAdapter) wait(ctx context.Context) error {
-	return c.backend.ContainerWaitWithContext(ctx, c.container.name())
+	return c.backend.ContainerWaitWithContext(ctx, c.container.nameOrID())
 }
 
 func (c *containerAdapter) shutdown(ctx context.Context) error {
-	// Default stop grace period to 10s.
-	stopgrace := 10
+	// Default stop grace period to nil (daemon will use the stopTimeout of the container)
+	var stopgrace *int
 	spec := c.container.spec()
 	if spec.StopGracePeriod != nil {
-		stopgrace = int(spec.StopGracePeriod.Seconds)
+		stopgraceValue := int(spec.StopGracePeriod.Seconds)
+		stopgrace = &stopgraceValue
 	}
 	return c.backend.ContainerStop(c.container.name(), stopgrace)
 }
@@ -190,7 +301,7 @@ func (c *containerAdapter) remove(ctx context.Context) error {
 	})
 }
 
-func (c *containerAdapter) createVolumes(ctx context.Context, backend executorpkg.Backend) error {
+func (c *containerAdapter) createVolumes(ctx context.Context) error {
 	// Create plugin volumes that are embedded inside a Mount
 	for _, mount := range c.container.task.Spec.GetContainer().Mounts {
 		if mount.Type != api.MountTypeVolume {
@@ -208,7 +319,7 @@ func (c *containerAdapter) createVolumes(ctx context.Context, backend executorpk
 		req := c.container.volumeCreateRequest(&mount)
 
 		// Check if this volume exists on the engine
-		if _, err := backend.VolumeCreate(req.Name, req.Driver, req.DriverOpts, req.Labels); err != nil {
+		if _, err := c.backend.VolumeCreate(req.Name, req.Driver, req.DriverOpts, req.Labels); err != nil {
 			// TODO(amitshukla): Today, volume create through the engine api does not return an error
 			// when the named volume with the same parameters already exists.
 			// It returns an error if the driver name is different - that is a valid error

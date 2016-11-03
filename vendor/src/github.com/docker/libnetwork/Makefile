@@ -7,6 +7,15 @@ docker = docker run --rm -it ${dockerargs} $$EXTRA_ARGS ${container_env} ${build
 ciargs = -e CIRCLECI -e "COVERALLS_TOKEN=$$COVERALLS_TOKEN" -e "INSIDECONTAINER=-incontainer=true"
 cidocker = docker run ${dockerargs} ${ciargs} $$EXTRA_ARGS ${container_env} ${build_image}
 CROSS_PLATFORMS = linux/amd64 linux/386 linux/arm windows/amd64
+export PATH := $(CURDIR)/bin:$(PATH)
+hostOS = ${shell go env GOHOSTOS}
+ifeq (${hostOS}, solaris)
+	gnufind=gfind
+	gnutail=gtail
+else
+	gnufind=find
+	gnutail=tail
+endif
 
 all: ${build_image}.created build check integration-tests clean
 
@@ -24,10 +33,11 @@ build: ${build_image}.created
 build-local:
 	@mkdir -p "bin"
 	$(shell which godep) go build -tags experimental -o "bin/dnet" ./cmd/dnet
+	$(shell which godep) go build -o "bin/docker-proxy" ./cmd/proxy
 
 clean:
 	@if [ -d bin ]; then \
-		echo "Removing dnet binaries"; \
+		echo "Removing dnet and proxy binaries"; \
 		rm -rf bin; \
 	fi
 
@@ -41,6 +51,7 @@ cross: ${build_image}.created
 
 cross-local:
 	$(shell which godep) go build -o "bin/dnet-$$GOOS-$$GOARCH" ./cmd/dnet
+	$(shell which godep) go build -o "bin/docker-proxy-$$GOOS-$$GOARCH" ./cmd/proxy
 
 check: ${build_image}.created
 	@${docker} ./wrapmake.sh check-local
@@ -59,7 +70,40 @@ check-format:
 run-tests:
 	@echo "Running tests... "
 	@echo "mode: count" > coverage.coverprofile
-	@for dir in $$(find . -maxdepth 10 -not -path './.git*' -not -path '*/_*' -type d); do \
+	@for dir in $$( ${gnufind} . -maxdepth 10 -not -path './.git*' -not -path '*/_*' -type d); do \
+	    if [ ${hostOS} == solaris ]; then \
+	        case "$$dir" in \
+		    "./cmd/dnet" ) \
+		    ;& \
+		    "./cmd/ovrouter" ) \
+		    ;& \
+		    "./ns" ) \
+		    ;& \
+		    "./iptables" ) \
+		    ;& \
+		    "./ipvs" ) \
+		    ;& \
+		    "./drivers/bridge" ) \
+		    ;& \
+		    "./drivers/host" ) \
+		    ;& \
+		    "./drivers/ipvlan" ) \
+		    ;& \
+		    "./drivers/macvlan" ) \
+		    ;& \
+		    "./drivers/overlay" ) \
+		    ;& \
+		    "./drivers/remote" ) \
+		    ;& \
+		    "./drivers/windows" ) \
+			echo "Skipping $$dir on solaris host... "; \
+			continue; \
+			;; \
+		    * )\
+			echo "Entering $$dir ... "; \
+			;; \
+	        esac; \
+	    fi; \
 	    if ls $$dir/*.go &> /dev/null; then \
 		pushd . &> /dev/null ; \
 		cd $$dir ; \
@@ -68,7 +112,7 @@ run-tests:
 		if [ $$ret -ne 0 ]; then exit $$ret; fi ;\
 		popd &> /dev/null; \
 		if [ -f $$dir/profile.tmp ]; then \
-			cat $$dir/profile.tmp | tail -n +2 >> coverage.coverprofile ; \
+			cat $$dir/profile.tmp | ${gnutail} -n +2 >> coverage.coverprofile ; \
 				rm $$dir/profile.tmp ; \
 	    fi ; \
 	fi ; \
@@ -102,4 +146,4 @@ circle-ci-check: ${build_image}.created
 circle-ci-build: ${build_image}.created
 	@${cidocker} make build-local
 
-circle-ci: circle-ci-check circle-ci-cross circle-ci-build integration-tests
+circle-ci: circle-ci-build circle-ci-check circle-ci-cross integration-tests

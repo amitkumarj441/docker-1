@@ -424,7 +424,7 @@ func TestChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	changes, err = d.Changes("3", "")
+	changes, err = d.Changes("3", "2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +530,7 @@ func TestChildDiffSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	diffSize, err = d.DiffSize("2", "")
+	diffSize, err = d.DiffSize("2", "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +550,7 @@ func TestExists(t *testing.T) {
 	}
 
 	if d.Exists("none") {
-		t.Fatal("id name should not exist in the driver")
+		t.Fatal("id none should not exist in the driver")
 	}
 
 	if !d.Exists("1") {

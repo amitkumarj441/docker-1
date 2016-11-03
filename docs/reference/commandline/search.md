@@ -1,30 +1,38 @@
-<!--[metadata]>
-+++
-title = "search"
-description = "The search command description and usage"
-keywords = ["search, hub, images"]
-[menu.main]
-parent = "smn_cli"
-+++
-<![end-metadata]-->
+---
+title: "search"
+description: "The search command description and usage"
+keywords: ["search, hub, images"]
+---
+
+<!-- This file is maintained within the docker/docker Github
+     repository at https://github.com/docker/docker/. Make all
+     pull requests against that repo. If you see this file in
+     another repository, consider it read-only there, as it will
+     periodically be overwritten by the definitive file. Pull
+     requests which include edits to this file in other repositories
+     will be rejected.
+-->
 
 # search
 
-    Usage: docker search [OPTIONS] TERM
+```markdown
+Usage:  docker search [OPTIONS] TERM
 
-    Search the Docker Hub for images
+Search the Docker Hub for images
 
-      --filter=[]          Filter output based on these conditions:
-                           - is-automated=(true|false)
-                           - is-official=(true|false)
-                           - stars=<number> - image has at least 'number' stars
-      --help               Print usage
-      --limit=25           Maximum returned search results
-      --no-trunc           Don't truncate output
+Options:
+  -f, --filter value   Filter output based on conditions provided (default [])
+                       - is-automated=(true|false)
+                       - is-official=(true|false)
+                       - stars=<number> - image has at least 'number' stars
+      --help           Print usage
+      --limit int      Max number of search results (default 25)
+      --no-trunc       Don't truncate output
+```
 
 Search [Docker Hub](https://hub.docker.com) for images
 
-See [*Find Public Images on Docker Hub*](../../tutorials/dockerrepos.md#searching-for-images) for
+See [*Find Public Images on Docker Hub*](https://docs.docker.com/engine/tutorials/dockerrepos/#searching-for-images) for
 more details on finding shared images from the command line.
 
 > **Note:**
@@ -49,7 +57,7 @@ This example displays images with a name containing 'busybox':
     ofayau/busybox-libc32            Busybox with 32 bits (and 64 bits) libs         1                    [OK]
     peelsky/zulu-openjdk-busybox                                                     1                    [OK]
     skomma/busybox-data              Docker image suitable for data volume cont...   1                    [OK]
-    elektritter/busybox-teamspeak    Leightweight teamspeak3 container based on...   1                    [OK]
+    elektritter/busybox-teamspeak    Lightweight teamspeak3 container based on...    1                    [OK]
     socketplane/busybox                                                              1                    [OK]
     oveits/docker-nginx-busybox      This is a tiny NginX docker image based on...   0                    [OK]
     ggtools/busybox-ubuntu           Busybox ubuntu version with extra goodies       0                    [OK]
@@ -77,7 +85,7 @@ at least 3 stars and the description isn't truncated in the output:
 
 ## Limit search results (--limit)
 
-The flag `--limit` is the maximium number of results returned by a search. This value could
+The flag `--limit` is the maximum number of results returned by a search. This value could
 be in the range between 1 and 100. The default value of `--limit` is 25.
 
 

@@ -1,31 +1,8 @@
 package hcsshim
 
 import (
-	"errors"
 	"io"
 	"time"
-)
-
-var (
-	// ErrInvalidNotificationType is an error encountered when an invalid notification type is used
-	ErrInvalidNotificationType = errors.New("hcsshim: invalid notification type")
-
-	// ErrTimeout is an error encountered when waiting on a notification times out
-	ErrTimeout = errors.New("hcsshim: timeout waiting for notification")
-
-	// ErrHandleClose is an error returned when the handle generating the notification being waited on has been closed
-	ErrHandleClose = errors.New("hcsshim: the handle generating this notification has been closed")
-
-	// ErrInvalidProcessState is an error encountered when the process is not in a valid state for the requested operation
-	ErrInvalidProcessState = errors.New("the process is in an invalid state for the attempted operation")
-
-	// ErrUnexpectedContainerExit is the error returned when a container exits while waiting for
-	// a different expected notification
-	ErrUnexpectedContainerExit = errors.New("unexpected container exit")
-
-	// ErrUnexpectedProcessAbort is the error returned when communication with the compute service
-	// is lost while waiting for a notification
-	ErrUnexpectedProcessAbort = errors.New("lost communication with compute service")
 )
 
 // ProcessConfig is used as both the input of Container.CreateProcess
@@ -39,7 +16,7 @@ type ProcessConfig struct {
 	CreateStdInPipe  bool
 	CreateStdOutPipe bool
 	CreateStdErrPipe bool
-	ConsoleSize      [2]int
+	ConsoleSize      [2]uint
 }
 
 type Layer struct {
@@ -48,54 +25,46 @@ type Layer struct {
 }
 
 type MappedDir struct {
-	HostPath      string
-	ContainerPath string
-	ReadOnly      bool
+	HostPath         string
+	ContainerPath    string
+	ReadOnly         bool
+	BandwidthMaximum uint64
+	IOPSMaximum      uint64
 }
 
 type HvRuntime struct {
-	ImagePath string `json:",omitempty"`
+	ImagePath    string `json:",omitempty"`
+	SkipTemplate bool   `json:",omitempty"`
 }
 
 // ContainerConfig is used as both the input of CreateContainer
 // and to convert the parameters to JSON for passing onto the HCS
-// TODO Windows: @darrenstahlmsft Add ProcessorCount
 type ContainerConfig struct {
-	SystemType              string      // HCS requires this to be hard-coded to "Container"
-	Name                    string      // Name of the container. We use the docker ID.
-	Owner                   string      // The management platform that created this container
-	IsDummy                 bool        // Used for development purposes.
-	VolumePath              string      // Windows volume path for scratch space
-	IgnoreFlushesDuringBoot bool        // Optimization hint for container startup in Windows
-	LayerFolderPath         string      // Where the layer folders are located
-	Layers                  []Layer     // List of storage layers
-	Credentials             string      `json:",omitempty"` // Credentials information
-	ProcessorWeight         uint64      `json:",omitempty"` // CPU Shares 0..10000 on Windows; where 0 will be omitted and HCS will default.
-	ProcessorMaximum        int64       `json:",omitempty"` // CPU maximum usage percent 1..100
-	StorageIOPSMaximum      uint64      `json:",omitempty"` // Maximum Storage IOPS
-	StorageBandwidthMaximum uint64      `json:",omitempty"` // Maximum Storage Bandwidth in bytes per second
-	StorageSandboxSize      uint64      `json:",omitempty"` // Size in bytes that the container system drive should be expanded to if smaller
-	MemoryMaximumInMB       int64       `json:",omitempty"` // Maximum memory available to the container in Megabytes
-	HostName                string      // Hostname
-	MappedDirectories       []MappedDir // List of mapped directories (volumes/mounts)
-	SandboxPath             string      // Location of unmounted sandbox (used for Hyper-V containers)
-	HvPartition             bool        // True if it a Hyper-V Container
-	EndpointList            []string    // List of networking endpoints to be attached to container
-	HvRuntime               *HvRuntime  // Hyper-V container settings
-	Servicing               bool        // True if this container is for servicing
+	SystemType               string      // HCS requires this to be hard-coded to "Container"
+	Name                     string      // Name of the container. We use the docker ID.
+	Owner                    string      // The management platform that created this container
+	IsDummy                  bool        // Used for development purposes.
+	VolumePath               string      `json:",omitempty"` // Windows volume path for scratch space. Used by Windows Server Containers only. Format \\?\\Volume{GUID}
+	IgnoreFlushesDuringBoot  bool        // Optimization hint for container startup in Windows
+	LayerFolderPath          string      `json:",omitempty"` // Where the layer folders are located. Used by Windows Server Containers only. Format  %root%\windowsfilter\containerID
+	Layers                   []Layer     // List of storage layers. Required for Windows Server and Hyper-V Containers. Format ID=GUID;Path=%root%\windowsfilter\layerID
+	Credentials              string      `json:",omitempty"` // Credentials information
+	ProcessorCount           uint32      `json:",omitempty"` // Number of processors to assign to the container.
+	ProcessorWeight          uint64      `json:",omitempty"` // CPU Shares 0..10000 on Windows; where 0 will be omitted and HCS will default.
+	ProcessorMaximum         int64       `json:",omitempty"` // CPU maximum usage percent 1..100
+	StorageIOPSMaximum       uint64      `json:",omitempty"` // Maximum Storage IOPS
+	StorageBandwidthMaximum  uint64      `json:",omitempty"` // Maximum Storage Bandwidth in bytes per second
+	StorageSandboxSize       uint64      `json:",omitempty"` // Size in bytes that the container system drive should be expanded to if smaller
+	MemoryMaximumInMB        int64       `json:",omitempty"` // Maximum memory available to the container in Megabytes
+	HostName                 string      // Hostname
+	MappedDirectories        []MappedDir // List of mapped directories (volumes/mounts)
+	SandboxPath              string      `json:",omitempty"` // Location of unmounted sandbox. Used by Hyper-V containers only. Format %root%\windowsfilter
+	HvPartition              bool        // True if it a Hyper-V Container
+	EndpointList             []string    // List of networking endpoints to be attached to container
+	HvRuntime                *HvRuntime  `json:",omitempty"` // Hyper-V container settings. Used by Hyper-V containers only. Format ImagePath=%root%\BaseLayerID\UtilityVM
+	Servicing                bool        // True if this container is for servicing
+	AllowUnqualifiedDNSQuery bool        // True to allow unqualified DNS name resolution
 }
-
-const (
-	notificationTypeNone           string = "None"
-	notificationTypeGracefulExit   string = "GracefulExit"
-	notificationTypeForcedExit     string = "ForcedExit"
-	notificationTypeUnexpectedExit string = "UnexpectedExit"
-	notificationTypeReboot         string = "Reboot"
-	notificationTypeConstructed    string = "Constructed"
-	notificationTypeStarted        string = "Started"
-	notificationTypePaused         string = "Paused"
-	notificationTypeUnknown        string = "Unknown"
-)
 
 // Container represents a created (but not necessarily running) container.
 type Container interface {
@@ -123,6 +92,12 @@ type Container interface {
 
 	// HasPendingUpdates returns true if the container has updates pending to install.
 	HasPendingUpdates() (bool, error)
+
+	// Statistics returns statistics for a container.
+	Statistics() (Statistics, error)
+
+	// ProcessList returns details for the processes in a container.
+	ProcessList() ([]ProcessListItem, error)
 
 	// CreateProcess launches a new process within the container.
 	CreateProcess(c *ProcessConfig) (Process, error)

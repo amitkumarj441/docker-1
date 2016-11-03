@@ -206,7 +206,7 @@ release_build() {
 			s3Os=Linux
 			;;
 		windows)
-			# this is windows use the .zip and .exe extentions for the files.
+			# this is windows use the .zip and .exe extensions for the files.
 			s3Os=Windows
 			zipExt=".zip"
 			binaryExt=".exe"
@@ -258,7 +258,7 @@ release_build() {
 
 # Upload binaries and tgz files to S3
 release_binaries() {
-	[ -e "bundles/$VERSION/cross/linux/amd64/docker-$VERSION" ] || {
+	[ "$(find bundles/$VERSION -path "bundles/$VERSION/cross/*/*/docker-$VERSION")" != "" ] || {
 		echo >&2 './hack/make.sh must be run before release_binaries'
 		exit 1
 	}

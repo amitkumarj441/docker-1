@@ -1,6 +1,6 @@
 package provider
 
-import "github.com/docker/engine-api/types"
+import "github.com/docker/docker/api/types"
 
 // NetworkCreateRequest is a request when creating a network.
 type NetworkCreateRequest struct {
@@ -13,7 +13,7 @@ type NetworkCreateResponse struct {
 	ID string `json:"Id"`
 }
 
-// VirtualAddress represents a virtual adress.
+// VirtualAddress represents a virtual address.
 type VirtualAddress struct {
 	IPv4 string
 	IPv6 string

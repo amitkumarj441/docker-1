@@ -3,46 +3,69 @@ package manager
 import (
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/ca"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/allocator"
 	"github.com/docker/swarmkit/manager/controlapi"
 	"github.com/docker/swarmkit/manager/dispatcher"
+	"github.com/docker/swarmkit/manager/health"
 	"github.com/docker/swarmkit/manager/keymanager"
-	"github.com/docker/swarmkit/manager/orchestrator"
-	"github.com/docker/swarmkit/manager/raftpicker"
+	"github.com/docker/swarmkit/manager/orchestrator/constraintenforcer"
+	"github.com/docker/swarmkit/manager/orchestrator/global"
+	"github.com/docker/swarmkit/manager/orchestrator/replicated"
+	"github.com/docker/swarmkit/manager/orchestrator/taskreaper"
+	"github.com/docker/swarmkit/manager/resourceapi"
 	"github.com/docker/swarmkit/manager/scheduler"
 	"github.com/docker/swarmkit/manager/state/raft"
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/docker/swarmkit/protobuf/ptypes"
+	"github.com/docker/swarmkit/xnet"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
 const (
 	// defaultTaskHistoryRetentionLimit is the number of tasks to keep.
-	defaultTaskHistoryRetentionLimit = 10
+	defaultTaskHistoryRetentionLimit = 5
 )
+
+// RemoteAddrs provides an listening address and an optional advertise address
+// for serving the remote API.
+type RemoteAddrs struct {
+	// Address to bind
+	ListenAddr string
+
+	// Address to advertise to remote nodes (optional).
+	AdvertiseAddr string
+}
 
 // Config is used to tune the Manager.
 type Config struct {
 	SecurityConfig *ca.SecurityConfig
 
-	ProtoAddr map[string]string
-	// ProtoListener will be used for grpc serving if it's not nil,
-	// ProtoAddr fields will be used to create listeners otherwise.
-	ProtoListener map[string]net.Listener
+	// ExternalCAs is a list of initial CAs to which a manager node
+	// will make certificate signing requests for node certificates.
+	ExternalCAs []*api.ExternalCA
+
+	// ControlAPI is an address for serving the control API.
+	ControlAPI string
+
+	// RemoteAPI is a listening address for serving the remote API, and
+	// an optional advertise address.
+	RemoteAPI RemoteAddrs
 
 	// JoinRaft is an optional address of a node in an existing raft
 	// cluster to join.
@@ -69,120 +92,119 @@ type Config struct {
 // subsystems.
 type Manager struct {
 	config    *Config
-	listeners map[string]net.Listener
+	listeners []net.Listener
 
 	caserver               *ca.Server
-	Dispatcher             *dispatcher.Dispatcher
-	replicatedOrchestrator *orchestrator.ReplicatedOrchestrator
-	globalOrchestrator     *orchestrator.GlobalOrchestrator
-	taskReaper             *orchestrator.TaskReaper
+	dispatcher             *dispatcher.Dispatcher
+	replicatedOrchestrator *replicated.Orchestrator
+	globalOrchestrator     *global.Orchestrator
+	taskReaper             *taskreaper.TaskReaper
+	constraintEnforcer     *constraintenforcer.ConstraintEnforcer
 	scheduler              *scheduler.Scheduler
 	allocator              *allocator.Allocator
 	keyManager             *keymanager.KeyManager
 	server                 *grpc.Server
 	localserver            *grpc.Server
-	RaftNode               *raft.Node
+	raftNode               *raft.Node
 
-	mu   sync.Mutex
+	cancelFunc context.CancelFunc
+
+	mu      sync.Mutex
+	started chan struct{}
+	stopped bool
+}
+
+type closeOnceListener struct {
 	once sync.Once
+	net.Listener
+}
 
-	stopped chan struct{}
+func (l *closeOnceListener) Close() error {
+	var err error
+	l.once.Do(func() {
+		err = l.Listener.Close()
+	})
+	return err
 }
 
 // New creates a Manager which has not started to accept requests yet.
 func New(config *Config) (*Manager, error) {
 	dispatcherConfig := dispatcher.DefaultConfig()
 
-	if config.ProtoAddr == nil {
-		config.ProtoAddr = make(map[string]string)
-	}
+	// If an AdvertiseAddr was specified, we use that as our
+	// externally-reachable address.
+	advertiseAddr := config.RemoteAPI.AdvertiseAddr
 
-	if config.ProtoListener != nil && config.ProtoListener["tcp"] != nil {
-		config.ProtoAddr["tcp"] = config.ProtoListener["tcp"].Addr().String()
-	}
-
-	tcpAddr := config.ProtoAddr["tcp"]
-
-	if tcpAddr == "" {
-		return nil, errors.New("no tcp listen address or listener provided")
-	}
-
-	listenHost, listenPort, err := net.SplitHostPort(tcpAddr)
-	if err == nil {
-		ip := net.ParseIP(listenHost)
-		if ip != nil && ip.IsUnspecified() {
-			// Find our local IP address associated with the default route.
-			// This may not be the appropriate address to use for internal
-			// cluster communications, but it seems like the best default.
-			// The admin can override this address if necessary.
-			conn, err := net.Dial("udp", "8.8.8.8:53")
-			if err != nil {
-				return nil, fmt.Errorf("could not determine local IP address: %v", err)
-			}
-			localAddr := conn.LocalAddr().String()
-			conn.Close()
-
-			listenHost, _, err = net.SplitHostPort(localAddr)
-			if err != nil {
-				return nil, fmt.Errorf("could not split local IP address: %v", err)
-			}
-
-			tcpAddr = net.JoinHostPort(listenHost, listenPort)
+	var advertiseAddrPort string
+	if advertiseAddr == "" {
+		// Otherwise, we know we are joining an existing swarm. Use a
+		// wildcard address to trigger remote autodetection of our
+		// address.
+		var err error
+		_, advertiseAddrPort, err = net.SplitHostPort(config.RemoteAPI.ListenAddr)
+		if err != nil {
+			return nil, fmt.Errorf("missing or invalid listen address %s", config.RemoteAPI.ListenAddr)
 		}
+
+		// Even with an IPv6 listening address, it's okay to use
+		// 0.0.0.0 here. Any "unspecified" (wildcard) IP will
+		// be substituted with the actual source address.
+		advertiseAddr = net.JoinHostPort("0.0.0.0", advertiseAddrPort)
 	}
 
-	// TODO(stevvooe): Reported address of manager is plumbed to listen addr
-	// for now, may want to make this separate. This can be tricky to get right
-	// so we need to make it easy to override. This needs to be the address
-	// through which agent nodes access the manager.
-	dispatcherConfig.Addr = tcpAddr
-
-	err = os.MkdirAll(filepath.Dir(config.ProtoAddr["unix"]), 0700)
+	err := os.MkdirAll(config.StateDir, 0700)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create socket directory: %v", err)
-	}
-
-	err = os.MkdirAll(config.StateDir, 0700)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create state directory: %v", err)
+		return nil, errors.Wrap(err, "failed to create state directory")
 	}
 
 	raftStateDir := filepath.Join(config.StateDir, "raft")
 	err = os.MkdirAll(raftStateDir, 0700)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create raft state directory: %v", err)
+		return nil, errors.Wrap(err, "failed to create raft state directory")
 	}
 
-	var listeners map[string]net.Listener
-	if len(config.ProtoListener) > 0 {
-		listeners = config.ProtoListener
-	} else {
-		listeners = make(map[string]net.Listener)
+	var listeners []net.Listener
 
-		for proto, addr := range config.ProtoAddr {
-			l, err := net.Listen(proto, addr)
-
-			// A unix socket may fail to bind if the file already
-			// exists. Try replacing the file.
-			unwrappedErr := err
-			if op, ok := unwrappedErr.(*net.OpError); ok {
-				unwrappedErr = op.Err
-			}
-			if sys, ok := unwrappedErr.(*os.SyscallError); ok {
-				unwrappedErr = sys.Err
-			}
-			if proto == "unix" && unwrappedErr == syscall.EADDRINUSE {
-				os.Remove(addr)
-				l, err = net.Listen(proto, addr)
-				if err != nil {
-					return nil, err
-				}
-			} else if err != nil {
-				return nil, err
-			}
-			listeners[proto] = l
+	// don't create a socket directory if we're on windows. we used named pipe
+	if runtime.GOOS != "windows" {
+		err := os.MkdirAll(filepath.Dir(config.ControlAPI), 0700)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to create socket directory")
 		}
 	}
+
+	l, err := xnet.ListenLocal(config.ControlAPI)
+
+	// A unix socket may fail to bind if the file already
+	// exists. Try replacing the file.
+	if runtime.GOOS != "windows" {
+		unwrappedErr := err
+		if op, ok := unwrappedErr.(*net.OpError); ok {
+			unwrappedErr = op.Err
+		}
+		if sys, ok := unwrappedErr.(*os.SyscallError); ok {
+			unwrappedErr = sys.Err
+		}
+		if unwrappedErr == syscall.EADDRINUSE {
+			os.Remove(config.ControlAPI)
+			l, err = xnet.ListenLocal(config.ControlAPI)
+		}
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to listen on control API address")
+	}
+
+	listeners = append(listeners, l)
+
+	l, err = net.Listen("tcp", config.RemoteAPI.ListenAddr)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to listen on remote API address")
+	}
+	if advertiseAddrPort == "0" {
+		advertiseAddr = l.Addr().String()
+		config.RemoteAPI.ListenAddr = advertiseAddr
+	}
+	listeners = append(listeners, l)
 
 	raftCfg := raft.DefaultNodeConfig()
 
@@ -193,22 +215,16 @@ func New(config *Config) (*Manager, error) {
 		raftCfg.HeartbeatTick = int(config.HeartbeatTick)
 	}
 
-	newNodeOpts := raft.NewNodeOptions{
+	newNodeOpts := raft.NodeOptions{
 		ID:              config.SecurityConfig.ClientTLSCreds.NodeID(),
-		Addr:            tcpAddr,
+		Addr:            advertiseAddr,
 		JoinAddr:        config.JoinRaft,
 		Config:          raftCfg,
 		StateDir:        raftStateDir,
 		ForceNewCluster: config.ForceNewCluster,
 		TLSCredentials:  config.SecurityConfig.ClientTLSCreds,
 	}
-	RaftNode, err := raft.NewNode(context.TODO(), newNodeOpts)
-	if err != nil {
-		for _, lis := range listeners {
-			lis.Close()
-		}
-		return nil, fmt.Errorf("can't create raft node: %v", err)
-	}
+	raftNode := raft.NewNode(newNodeOpts)
 
 	opts := []grpc.ServerOption{
 		grpc.Creds(config.SecurityConfig.ServerTLSCreds)}
@@ -216,245 +232,78 @@ func New(config *Config) (*Manager, error) {
 	m := &Manager{
 		config:      config,
 		listeners:   listeners,
-		caserver:    ca.NewServer(RaftNode.MemoryStore(), config.SecurityConfig),
-		Dispatcher:  dispatcher.New(RaftNode, dispatcherConfig),
+		caserver:    ca.NewServer(raftNode.MemoryStore(), config.SecurityConfig),
+		dispatcher:  dispatcher.New(raftNode, dispatcherConfig),
 		server:      grpc.NewServer(opts...),
 		localserver: grpc.NewServer(opts...),
-		RaftNode:    RaftNode,
-		stopped:     make(chan struct{}),
+		raftNode:    raftNode,
+		started:     make(chan struct{}),
 	}
 
 	return m, nil
 }
 
+// Addr returns tcp address on which remote api listens.
+func (m *Manager) Addr() string {
+	return m.config.RemoteAPI.ListenAddr
+}
+
 // Run starts all manager sub-systems and the gRPC server at the configured
 // address.
 // The call never returns unless an error occurs or `Stop()` is called.
-//
-// TODO(aluzzardi): /!\ This function is *way* too complex. /!\
-// It needs to be split into smaller manageable functions.
 func (m *Manager) Run(parent context.Context) error {
 	ctx, ctxCancel := context.WithCancel(parent)
 	defer ctxCancel()
 
-	// Harakiri.
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-m.stopped:
-			ctxCancel()
-		}
-	}()
+	m.cancelFunc = ctxCancel
 
-	leadershipCh, cancel := m.RaftNode.SubscribeLeadership()
+	leadershipCh, cancel := m.raftNode.SubscribeLeadership()
 	defer cancel()
 
-	go func() {
-		for leadershipEvent := range leadershipCh {
-			// read out and discard all of the messages when we've stopped
-			// don't acquire the mutex yet. if stopped is closed, we don't need
-			// this stops this loop from starving Run()'s attempt to Lock
-			select {
-			case <-m.stopped:
-				continue
-			default:
-				// do nothing, we're not stopped
-			}
-			// we're not stopping so NOW acquire the mutex
-			m.mu.Lock()
-			newState := leadershipEvent.(raft.LeadershipState)
-
-			if newState == raft.IsLeader {
-				s := m.RaftNode.MemoryStore()
-
-				rootCA := m.config.SecurityConfig.RootCA()
-				nodeID := m.config.SecurityConfig.ClientTLSCreds.NodeID()
-
-				raftCfg := raft.DefaultRaftConfig()
-				raftCfg.ElectionTick = uint32(m.RaftNode.Config.ElectionTick)
-				raftCfg.HeartbeatTick = uint32(m.RaftNode.Config.HeartbeatTick)
-
-				clusterID := m.config.SecurityConfig.ClientTLSCreds.Organization()
-				s.Update(func(tx store.Tx) error {
-					// Add a default cluster object to the
-					// store. Don't check the error because
-					// we expect this to fail unless this
-					// is a brand new cluster.
-					store.CreateCluster(tx, &api.Cluster{
-						ID: clusterID,
-						Spec: api.ClusterSpec{
-							Annotations: api.Annotations{
-								Name: store.DefaultClusterName,
-							},
-							AcceptancePolicy: ca.DefaultAcceptancePolicy(),
-							Orchestration: api.OrchestrationConfig{
-								TaskHistoryRetentionLimit: defaultTaskHistoryRetentionLimit,
-							},
-							Dispatcher: api.DispatcherConfig{
-								HeartbeatPeriod: ptypes.DurationProto(dispatcher.DefaultHeartBeatPeriod),
-							},
-							Raft:     raftCfg,
-							CAConfig: ca.DefaultCAConfig(),
-						},
-						RootCA: api.RootCA{
-							CAKey:      rootCA.Key,
-							CACert:     rootCA.Cert,
-							CACertHash: rootCA.Digest.String(),
-						},
-					})
-					// Add Node entry for ourself, if one
-					// doesn't exist already.
-					store.CreateNode(tx, &api.Node{
-						ID: nodeID,
-						Certificate: api.Certificate{
-							CN:   nodeID,
-							Role: api.NodeRoleManager,
-							Status: api.IssuanceStatus{
-								State: api.IssuanceStateIssued,
-							},
-						},
-						Spec: api.NodeSpec{
-							Role:       api.NodeRoleManager,
-							Membership: api.NodeMembershipAccepted,
-						},
-					})
-					return nil
-				})
-
-				// Attempt to rotate the key-encrypting-key of the root CA key-material
-				err := m.rotateRootCAKEK(ctx, clusterID)
-				if err != nil {
-					log.G(ctx).WithError(err).Error("root key-encrypting-key rotation failed")
-				}
-
-				m.replicatedOrchestrator = orchestrator.New(s)
-				m.globalOrchestrator = orchestrator.NewGlobalOrchestrator(s)
-				m.taskReaper = orchestrator.NewTaskReaper(s)
-				m.scheduler = scheduler.New(s)
-				m.keyManager = keymanager.New(m.RaftNode.MemoryStore(), keymanager.DefaultConfig())
-
-				// TODO(stevvooe): Allocate a context that can be used to
-				// shutdown underlying manager processes when leadership is
-				// lost.
-
-				m.allocator, err = allocator.New(s)
-				if err != nil {
-					log.G(ctx).WithError(err).Error("failed to create allocator")
-					// TODO(stevvooe): It doesn't seem correct here to fail
-					// creating the allocator but then use it anyways.
-				}
-
-				go func(keyManager *keymanager.KeyManager) {
-					if err := keyManager.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("keymanager failed with an error")
-					}
-				}(m.keyManager)
-
-				go func(d *dispatcher.Dispatcher) {
-					if err := d.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("Dispatcher exited with an error")
-					}
-				}(m.Dispatcher)
-
-				go func(server *ca.Server) {
-					if err := server.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("CA signer exited with an error")
-					}
-				}(m.caserver)
-
-				// Start all sub-components in separate goroutines.
-				// TODO(aluzzardi): This should have some kind of error handling so that
-				// any component that goes down would bring the entire manager down.
-
-				if m.allocator != nil {
-					go func(allocator *allocator.Allocator) {
-						if err := allocator.Run(ctx); err != nil {
-							log.G(ctx).WithError(err).Error("allocator exited with an error")
-						}
-					}(m.allocator)
-				}
-
-				go func(scheduler *scheduler.Scheduler) {
-					if err := scheduler.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("scheduler exited with an error")
-					}
-				}(m.scheduler)
-				go func(taskReaper *orchestrator.TaskReaper) {
-					taskReaper.Run()
-				}(m.taskReaper)
-				go func(orchestrator *orchestrator.ReplicatedOrchestrator) {
-					if err := orchestrator.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("replicated orchestrator exited with an error")
-					}
-				}(m.replicatedOrchestrator)
-				go func(globalOrchestrator *orchestrator.GlobalOrchestrator) {
-					if err := globalOrchestrator.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("global orchestrator exited with an error")
-					}
-				}(m.globalOrchestrator)
-
-			} else if newState == raft.IsFollower {
-				m.Dispatcher.Stop()
-				m.caserver.Stop()
-
-				if m.allocator != nil {
-					m.allocator.Stop()
-					m.allocator = nil
-				}
-
-				m.replicatedOrchestrator.Stop()
-				m.replicatedOrchestrator = nil
-
-				m.globalOrchestrator.Stop()
-				m.globalOrchestrator = nil
-
-				m.taskReaper.Stop()
-				m.taskReaper = nil
-
-				m.scheduler.Stop()
-				m.scheduler = nil
-
-				m.keyManager.Stop()
-				m.keyManager = nil
-			}
-			m.mu.Unlock()
-		}
-	}()
-
-	go func() {
-		err := m.RaftNode.Run(ctx)
-		if err != nil {
-			log.G(ctx).Error(err)
-			m.Stop(ctx)
-		}
-	}()
-
-	proxyOpts := []grpc.DialOption{
-		grpc.WithBackoffMaxDelay(2 * time.Second),
-		grpc.WithTransportCredentials(m.config.SecurityConfig.ClientTLSCreds),
-	}
-
-	cs := raftpicker.NewConnSelector(m.RaftNode, proxyOpts...)
+	go m.handleLeadershipEvents(ctx, leadershipCh)
 
 	authorize := func(ctx context.Context, roles []string) error {
+		var (
+			blacklistedCerts map[string]*api.BlacklistedCertificate
+			clusters         []*api.Cluster
+			err              error
+		)
+
+		m.raftNode.MemoryStore().View(func(readTx store.ReadTx) {
+			clusters, err = store.FindClusters(readTx, store.ByName("default"))
+
+		})
+
+		// Not having a cluster object yet means we can't check
+		// the blacklist.
+		if err == nil && len(clusters) == 1 {
+			blacklistedCerts = clusters[0].BlacklistedCertificates
+		}
+
 		// Authorize the remote roles, ensure they can only be forwarded by managers
-		_, err := ca.AuthorizeForwardedRoleAndOrg(ctx, roles, []string{ca.ManagerRole}, m.config.SecurityConfig.ClientTLSCreds.Organization())
+		_, err = ca.AuthorizeForwardedRoleAndOrg(ctx, roles, []string{ca.ManagerRole}, m.config.SecurityConfig.ClientTLSCreds.Organization(), blacklistedCerts)
 		return err
 	}
 
-	baseControlAPI := controlapi.NewServer(m.RaftNode.MemoryStore(), m.RaftNode)
+	baseControlAPI := controlapi.NewServer(m.raftNode.MemoryStore(), m.raftNode, m.config.SecurityConfig.RootCA())
+	baseResourceAPI := resourceapi.New(m.raftNode.MemoryStore())
+	healthServer := health.NewHealthServer()
+	localHealthServer := health.NewHealthServer()
 
 	authenticatedControlAPI := api.NewAuthenticatedWrapperControlServer(baseControlAPI, authorize)
-	authenticatedDispatcherAPI := api.NewAuthenticatedWrapperDispatcherServer(m.Dispatcher, authorize)
+	authenticatedResourceAPI := api.NewAuthenticatedWrapperResourceAllocatorServer(baseResourceAPI, authorize)
+	authenticatedDispatcherAPI := api.NewAuthenticatedWrapperDispatcherServer(m.dispatcher, authorize)
 	authenticatedCAAPI := api.NewAuthenticatedWrapperCAServer(m.caserver, authorize)
 	authenticatedNodeCAAPI := api.NewAuthenticatedWrapperNodeCAServer(m.caserver, authorize)
-	authenticatedRaftAPI := api.NewAuthenticatedWrapperRaftServer(m.RaftNode, authorize)
-	authenticatedRaftMembershipAPI := api.NewAuthenticatedWrapperRaftMembershipServer(m.RaftNode, authorize)
+	authenticatedRaftAPI := api.NewAuthenticatedWrapperRaftServer(m.raftNode, authorize)
+	authenticatedHealthAPI := api.NewAuthenticatedWrapperHealthServer(healthServer, authorize)
+	authenticatedRaftMembershipAPI := api.NewAuthenticatedWrapperRaftMembershipServer(m.raftNode, authorize)
 
-	proxyDispatcherAPI := api.NewRaftProxyDispatcherServer(authenticatedDispatcherAPI, cs, m.RaftNode, ca.WithMetadataForwardTLSInfo)
-	proxyCAAPI := api.NewRaftProxyCAServer(authenticatedCAAPI, cs, m.RaftNode, ca.WithMetadataForwardTLSInfo)
-	proxyNodeCAAPI := api.NewRaftProxyNodeCAServer(authenticatedNodeCAAPI, cs, m.RaftNode, ca.WithMetadataForwardTLSInfo)
-	proxyRaftMembershipAPI := api.NewRaftProxyRaftMembershipServer(authenticatedRaftMembershipAPI, cs, m.RaftNode, ca.WithMetadataForwardTLSInfo)
+	proxyDispatcherAPI := api.NewRaftProxyDispatcherServer(authenticatedDispatcherAPI, m.raftNode, ca.WithMetadataForwardTLSInfo)
+	proxyCAAPI := api.NewRaftProxyCAServer(authenticatedCAAPI, m.raftNode, ca.WithMetadataForwardTLSInfo)
+	proxyNodeCAAPI := api.NewRaftProxyNodeCAServer(authenticatedNodeCAAPI, m.raftNode, ca.WithMetadataForwardTLSInfo)
+	proxyRaftMembershipAPI := api.NewRaftProxyRaftMembershipServer(authenticatedRaftMembershipAPI, m.raftNode, ca.WithMetadataForwardTLSInfo)
+	proxyResourceAPI := api.NewRaftProxyResourceAllocatorServer(authenticatedResourceAPI, m.raftNode, ca.WithMetadataForwardTLSInfo)
 
 	// localProxyControlAPI is a special kind of proxy. It is only wired up
 	// to receive requests from a trusted local socket, and these requests
@@ -463,100 +312,113 @@ func (m *Manager) Run(parent context.Context) error {
 	// this manager rather than forwarded requests (it has no TLS
 	// information to put in the metadata map).
 	forwardAsOwnRequest := func(ctx context.Context) (context.Context, error) { return ctx, nil }
-	localProxyControlAPI := api.NewRaftProxyControlServer(baseControlAPI, cs, m.RaftNode, forwardAsOwnRequest)
+	localProxyControlAPI := api.NewRaftProxyControlServer(baseControlAPI, m.raftNode, forwardAsOwnRequest)
 
 	// Everything registered on m.server should be an authenticated
 	// wrapper, or a proxy wrapping an authenticated wrapper!
 	api.RegisterCAServer(m.server, proxyCAAPI)
 	api.RegisterNodeCAServer(m.server, proxyNodeCAAPI)
 	api.RegisterRaftServer(m.server, authenticatedRaftAPI)
+	api.RegisterHealthServer(m.server, authenticatedHealthAPI)
 	api.RegisterRaftMembershipServer(m.server, proxyRaftMembershipAPI)
-	api.RegisterControlServer(m.localserver, localProxyControlAPI)
 	api.RegisterControlServer(m.server, authenticatedControlAPI)
+	api.RegisterResourceAllocatorServer(m.server, proxyResourceAPI)
 	api.RegisterDispatcherServer(m.server, proxyDispatcherAPI)
 
-	errServe := make(chan error, 2)
-	for proto, l := range m.listeners {
-		go func(proto string, lis net.Listener) {
-			ctx := log.WithLogger(ctx, log.G(ctx).WithFields(
-				logrus.Fields{
-					"proto": lis.Addr().Network(),
-					"addr":  lis.Addr().String()}))
-			if proto == "unix" {
-				log.G(ctx).Info("Listening for local connections")
-				errServe <- m.localserver.Serve(lis)
-			} else {
-				log.G(ctx).Info("Listening for connections")
-				errServe <- m.server.Serve(lis)
-			}
-		}(proto, l)
+	api.RegisterControlServer(m.localserver, localProxyControlAPI)
+	api.RegisterHealthServer(m.localserver, localHealthServer)
+
+	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_NOT_SERVING)
+	localHealthServer.SetServingStatus("ControlAPI", api.HealthCheckResponse_NOT_SERVING)
+
+	errServe := make(chan error, len(m.listeners))
+	for _, lis := range m.listeners {
+		go m.serveListener(ctx, errServe, lis)
 	}
 
-	if err := raft.WaitForLeader(ctx, m.RaftNode); err != nil {
+	defer func() {
 		m.server.Stop()
+		m.localserver.Stop()
+	}()
+
+	// Set the raft server as serving for the health server
+	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
+
+	if err := m.raftNode.JoinAndStart(ctx); err != nil {
+		return errors.Wrap(err, "can't initialize raft node")
+	}
+
+	localHealthServer.SetServingStatus("ControlAPI", api.HealthCheckResponse_SERVING)
+
+	close(m.started)
+
+	go func() {
+		err := m.raftNode.Run(ctx)
+		if err != nil {
+			log.G(ctx).Error(err)
+			m.Stop(ctx)
+		}
+	}()
+
+	if err := raft.WaitForLeader(ctx, m.raftNode); err != nil {
 		return err
 	}
 
-	c, err := raft.WaitForCluster(ctx, m.RaftNode)
+	c, err := raft.WaitForCluster(ctx, m.raftNode)
 	if err != nil {
-		m.server.Stop()
 		return err
 	}
 	raftConfig := c.Spec.Raft
 
-	if int(raftConfig.ElectionTick) != m.RaftNode.Config.ElectionTick {
-		log.G(ctx).Warningf("election tick value (%ds) is different from the one defined in the cluster config (%vs), the cluster may be unstable", m.RaftNode.Config.ElectionTick, raftConfig.ElectionTick)
+	if int(raftConfig.ElectionTick) != m.raftNode.Config.ElectionTick {
+		log.G(ctx).Warningf("election tick value (%ds) is different from the one defined in the cluster config (%vs), the cluster may be unstable", m.raftNode.Config.ElectionTick, raftConfig.ElectionTick)
 	}
-	if int(raftConfig.HeartbeatTick) != m.RaftNode.Config.HeartbeatTick {
-		log.G(ctx).Warningf("heartbeat tick value (%ds) is different from the one defined in the cluster config (%vs), the cluster may be unstable", m.RaftNode.Config.HeartbeatTick, raftConfig.HeartbeatTick)
+	if int(raftConfig.HeartbeatTick) != m.raftNode.Config.HeartbeatTick {
+		log.G(ctx).Warningf("heartbeat tick value (%ds) is different from the one defined in the cluster config (%vs), the cluster may be unstable", m.raftNode.Config.HeartbeatTick, raftConfig.HeartbeatTick)
 	}
 
 	// wait for an error in serving.
 	err = <-errServe
-	select {
-	// check to see if stopped was posted to. if so, we're in the process of
-	// stopping, or done and that's why we got the error. if stopping is
-	// deliberate, stopped will ALWAYS be closed before the error is trigger,
-	// so this path will ALWAYS be taken if the stop was deliberate
-	case <-m.stopped:
-		// shutdown was requested, do not return an error
-		// but first, we wait to acquire a mutex to guarantee that stopping is
-		// finished. as long as we acquire the mutex BEFORE we return, we know
-		// that stopping is stopped.
-		m.mu.Lock()
+	m.mu.Lock()
+	if m.stopped {
 		m.mu.Unlock()
 		return nil
-	// otherwise, we'll get something from errServe, which indicates that an
-	// error in serving has actually occurred and this isn't a planned shutdown
-	default:
-		return err
 	}
+	m.mu.Unlock()
+	m.Stop(ctx)
+	return err
 }
+
+const stopTimeout = 8 * time.Second
 
 // Stop stops the manager. It immediately closes all open connections and
 // active RPCs as well as stopping the scheduler.
 func (m *Manager) Stop(ctx context.Context) {
 	log.G(ctx).Info("Stopping manager")
+	// It's not safe to start shutting down while the manager is still
+	// starting up.
+	<-m.started
 
 	// the mutex stops us from trying to stop while we're alrady stopping, or
 	// from returning before we've finished stopping.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	select {
-
-	// check to see that we've already stopped
-	case <-m.stopped:
+	if m.stopped {
 		return
-	default:
-		// do nothing, we're stopping for the first time
 	}
+	m.stopped = true
 
-	// once we start stopping, send a signal that we're doing so. this tells
-	// Run that we've started stopping, when it gets the error from errServe
-	// it also prevents the loop from processing any more stuff.
-	close(m.stopped)
+	srvDone, localSrvDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		m.server.GracefulStop()
+		close(srvDone)
+	}()
+	go func() {
+		m.localserver.GracefulStop()
+		close(localSrvDone)
+	}()
 
-	m.Dispatcher.Stop()
+	m.dispatcher.Stop()
 	m.caserver.Stop()
 
 	if m.allocator != nil {
@@ -571,6 +433,9 @@ func (m *Manager) Stop(ctx context.Context) {
 	if m.taskReaper != nil {
 		m.taskReaper.Stop()
 	}
+	if m.constraintEnforcer != nil {
+		m.constraintEnforcer.Stop()
+	}
 	if m.scheduler != nil {
 		m.scheduler.Stop()
 	}
@@ -578,10 +443,22 @@ func (m *Manager) Stop(ctx context.Context) {
 		m.keyManager.Stop()
 	}
 
-	m.RaftNode.Shutdown()
-	// some time after this point, Run will receive an error from one of these
-	m.server.Stop()
-	m.localserver.Stop()
+	m.cancelFunc()
+	<-m.raftNode.Done()
+
+	timer := time.AfterFunc(stopTimeout, func() {
+		m.server.Stop()
+		m.localserver.Stop()
+	})
+	defer timer.Stop()
+	// TODO: we're not waiting on ctx because it very well could be passed from Run,
+	// which is already cancelled here. We need to refactor that.
+	select {
+	case <-srvDone:
+		<-localSrvDone
+	case <-localSrvDone:
+		<-srvDone
+	}
 
 	log.G(ctx).Info("Manager shut down")
 	// mutex is released and Run can return now
@@ -603,7 +480,7 @@ func (m *Manager) rotateRootCAKEK(ctx context.Context, clusterID string) error {
 	passphrase := []byte(strPassphrase)
 	passphrasePrev := []byte(strPassphrasePrev)
 
-	s := m.RaftNode.MemoryStore()
+	s := m.raftNode.MemoryStore()
 	var (
 		cluster  *api.Cluster
 		err      error
@@ -619,7 +496,7 @@ func (m *Manager) rotateRootCAKEK(ctx context.Context, clusterID string) error {
 
 	// Try to get the private key from the cluster
 	privKeyPEM := cluster.RootCA.CAKey
-	if privKeyPEM == nil || len(privKeyPEM) == 0 {
+	if len(privKeyPEM) == 0 {
 		// We have no PEM root private key in this cluster.
 		log.G(ctx).Warnf("cluster %s does not have private key material", clusterID)
 		return nil
@@ -676,4 +553,236 @@ func (m *Manager) rotateRootCAKEK(ctx context.Context, clusterID string) error {
 		return store.UpdateCluster(tx, cluster)
 	})
 
+}
+
+// handleLeadershipEvents handles the is leader event or is follower event.
+func (m *Manager) handleLeadershipEvents(ctx context.Context, leadershipCh chan events.Event) {
+	for {
+		select {
+		case leadershipEvent := <-leadershipCh:
+			m.mu.Lock()
+			if m.stopped {
+				m.mu.Unlock()
+				return
+			}
+			newState := leadershipEvent.(raft.LeadershipState)
+
+			if newState == raft.IsLeader {
+				m.becomeLeader(ctx)
+			} else if newState == raft.IsFollower {
+				m.becomeFollower()
+			}
+			m.mu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// serveListener serves a listener for local and non local connections.
+func (m *Manager) serveListener(ctx context.Context, errServe chan error, l net.Listener) {
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(
+		logrus.Fields{
+			"proto": l.Addr().Network(),
+			"addr":  l.Addr().String(),
+		}))
+	if _, ok := l.(*net.TCPListener); !ok {
+		log.G(ctx).Info("Listening for local connections")
+		// we need to disallow double closes because UnixListener.Close
+		// can delete unix-socket file of newer listener. grpc calls
+		// Close twice indeed: in Serve and in Stop.
+		errServe <- m.localserver.Serve(&closeOnceListener{Listener: l})
+	} else {
+		log.G(ctx).Info("Listening for connections")
+		errServe <- m.server.Serve(l)
+	}
+}
+
+// becomeLeader starts the subsystems that are run on the leader.
+func (m *Manager) becomeLeader(ctx context.Context) {
+	s := m.raftNode.MemoryStore()
+
+	rootCA := m.config.SecurityConfig.RootCA()
+	nodeID := m.config.SecurityConfig.ClientTLSCreds.NodeID()
+
+	raftCfg := raft.DefaultRaftConfig()
+	raftCfg.ElectionTick = uint32(m.raftNode.Config.ElectionTick)
+	raftCfg.HeartbeatTick = uint32(m.raftNode.Config.HeartbeatTick)
+
+	clusterID := m.config.SecurityConfig.ClientTLSCreds.Organization()
+
+	initialCAConfig := ca.DefaultCAConfig()
+	initialCAConfig.ExternalCAs = m.config.ExternalCAs
+
+	s.Update(func(tx store.Tx) error {
+		// Add a default cluster object to the
+		// store. Don't check the error because
+		// we expect this to fail unless this
+		// is a brand new cluster.
+		store.CreateCluster(tx, defaultClusterObject(clusterID, initialCAConfig, raftCfg, rootCA))
+		// Add Node entry for ourself, if one
+		// doesn't exist already.
+		store.CreateNode(tx, managerNode(nodeID))
+		return nil
+	})
+
+	// Attempt to rotate the key-encrypting-key of the root CA key-material
+	err := m.rotateRootCAKEK(ctx, clusterID)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("root key-encrypting-key rotation failed")
+	}
+
+	m.replicatedOrchestrator = replicated.NewReplicatedOrchestrator(s)
+	m.constraintEnforcer = constraintenforcer.New(s)
+	m.globalOrchestrator = global.NewGlobalOrchestrator(s)
+	m.taskReaper = taskreaper.New(s)
+	m.scheduler = scheduler.New(s)
+	m.keyManager = keymanager.New(s, keymanager.DefaultConfig())
+
+	// TODO(stevvooe): Allocate a context that can be used to
+	// shutdown underlying manager processes when leadership is
+	// lost.
+
+	m.allocator, err = allocator.New(s)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("failed to create allocator")
+		// TODO(stevvooe): It doesn't seem correct here to fail
+		// creating the allocator but then use it anyway.
+	}
+
+	if m.keyManager != nil {
+		go func(keyManager *keymanager.KeyManager) {
+			if err := keyManager.Run(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("keymanager failed with an error")
+			}
+		}(m.keyManager)
+	}
+
+	go func(d *dispatcher.Dispatcher) {
+		if err := d.Run(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("Dispatcher exited with an error")
+		}
+	}(m.dispatcher)
+
+	go func(server *ca.Server) {
+		if err := server.Run(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("CA signer exited with an error")
+		}
+	}(m.caserver)
+
+	// Start all sub-components in separate goroutines.
+	// TODO(aluzzardi): This should have some kind of error handling so that
+	// any component that goes down would bring the entire manager down.
+	if m.allocator != nil {
+		go func(allocator *allocator.Allocator) {
+			if err := allocator.Run(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("allocator exited with an error")
+			}
+		}(m.allocator)
+	}
+
+	go func(scheduler *scheduler.Scheduler) {
+		if err := scheduler.Run(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("scheduler exited with an error")
+		}
+	}(m.scheduler)
+
+	go func(constraintEnforcer *constraintenforcer.ConstraintEnforcer) {
+		constraintEnforcer.Run()
+	}(m.constraintEnforcer)
+
+	go func(taskReaper *taskreaper.TaskReaper) {
+		taskReaper.Run()
+	}(m.taskReaper)
+
+	go func(orchestrator *replicated.Orchestrator) {
+		if err := orchestrator.Run(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("replicated orchestrator exited with an error")
+		}
+	}(m.replicatedOrchestrator)
+
+	go func(globalOrchestrator *global.Orchestrator) {
+		if err := globalOrchestrator.Run(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("global orchestrator exited with an error")
+		}
+	}(m.globalOrchestrator)
+
+}
+
+// becomeFollower shuts down the subsystems that are only run by the leader.
+func (m *Manager) becomeFollower() {
+	m.dispatcher.Stop()
+	m.caserver.Stop()
+
+	if m.allocator != nil {
+		m.allocator.Stop()
+		m.allocator = nil
+	}
+
+	m.constraintEnforcer.Stop()
+	m.constraintEnforcer = nil
+
+	m.replicatedOrchestrator.Stop()
+	m.replicatedOrchestrator = nil
+
+	m.globalOrchestrator.Stop()
+	m.globalOrchestrator = nil
+
+	m.taskReaper.Stop()
+	m.taskReaper = nil
+
+	m.scheduler.Stop()
+	m.scheduler = nil
+
+	if m.keyManager != nil {
+		m.keyManager.Stop()
+		m.keyManager = nil
+	}
+}
+
+// defaultClusterObject creates a default cluster.
+func defaultClusterObject(clusterID string, initialCAConfig api.CAConfig, raftCfg api.RaftConfig, rootCA *ca.RootCA) *api.Cluster {
+	return &api.Cluster{
+		ID: clusterID,
+		Spec: api.ClusterSpec{
+			Annotations: api.Annotations{
+				Name: store.DefaultClusterName,
+			},
+			Orchestration: api.OrchestrationConfig{
+				TaskHistoryRetentionLimit: defaultTaskHistoryRetentionLimit,
+			},
+			Dispatcher: api.DispatcherConfig{
+				HeartbeatPeriod: ptypes.DurationProto(dispatcher.DefaultHeartBeatPeriod),
+			},
+			Raft:     raftCfg,
+			CAConfig: initialCAConfig,
+		},
+		RootCA: api.RootCA{
+			CAKey:      rootCA.Key,
+			CACert:     rootCA.Cert,
+			CACertHash: rootCA.Digest.String(),
+			JoinTokens: api.JoinTokens{
+				Worker:  ca.GenerateJoinToken(rootCA),
+				Manager: ca.GenerateJoinToken(rootCA),
+			},
+		},
+	}
+}
+
+// managerNode creates a new node with NodeRoleManager role.
+func managerNode(nodeID string) *api.Node {
+	return &api.Node{
+		ID: nodeID,
+		Certificate: api.Certificate{
+			CN:   nodeID,
+			Role: api.NodeRoleManager,
+			Status: api.IssuanceStatus{
+				State: api.IssuanceStateIssued,
+			},
+		},
+		Spec: api.NodeSpec{
+			Role:       api.NodeRoleManager,
+			Membership: api.NodeMembershipAccepted,
+		},
+	}
 }

@@ -6,6 +6,7 @@ dockerd - Enable daemon mode
 
 # SYNOPSIS
 **dockerd**
+[**--add-runtime**[=*[]*]]
 [**--api-cors-header**=[=*API-CORS-HEADER*]]
 [**--authorization-plugin**[=*[]*]]
 [**-b**|**--bridge**[=*BRIDGE*]]
@@ -26,6 +27,7 @@ dockerd - Enable daemon mode
 [**--dns-search**[=*[]*]]
 [**--exec-opt**[=*[]*]]
 [**--exec-root**[=*/var/run/docker*]]
+[**--experimental**[=*false*]]
 [**--fixed-cidr**[=*FIXED-CIDR*]]
 [**--fixed-cidr-v6**[=*FIXED-CIDR-V6*]]
 [**-G**|**--group**[=*docker*]]
@@ -33,6 +35,8 @@ dockerd - Enable daemon mode
 [**-H**|**--host**[=*[]*]]
 [**--help**]
 [**--icc**[=*true*]]
+[**--init**[=*false*]]
+[**--init-path**[=*""*]]
 [**--insecure-registry**[=*[]*]]
 [**--ip**[=*0.0.0.0*]]
 [**--ip-forward**[=*true*]]
@@ -53,13 +57,16 @@ dockerd - Enable daemon mode
 [**--registry-mirror**[=*[]*]]
 [**-s**|**--storage-driver**[=*STORAGE-DRIVER*]]
 [**--selinux-enabled**]
+[**--shutdown-timeout**[=*15*]]
 [**--storage-opt**[=*[]*]]
+[**--swarm-default-advertise-addr**[=*IP|INTERFACE*]]
 [**--tls**]
 [**--tlscacert**[=*~/.docker/ca.pem*]]
 [**--tlscert**[=*~/.docker/cert.pem*]]
 [**--tlskey**[=*~/.docker/key.pem*]]
 [**--tlsverify**]
 [**--userland-proxy**[=*true*]]
+[**--userland-proxy-path**[=*""*]]
 [**--userns-remap**[=*default*]]
 
 # DESCRIPTION
@@ -74,6 +81,9 @@ format.
 **dockerd [OPTIONS]**
 
 # OPTIONS
+
+**--add-runtime**=[]
+  Set additional OCI compatible runtime.
 
 **--api-cors-header**=""
   Set CORS headers in the remote API. Default is cors disabled. Give urls like "http://foo, http://bar, ...". Give "*" to allow all.
@@ -117,10 +127,10 @@ format.
   IPv6 address of the container default gateway
 
 **--default-ulimit**=[]
-  Set default ulimits for containers.
+  Default ulimits for containers.
 
 **--disable-legacy-registry**=*true*|*false*
-  Do not contact legacy registries
+  Disable contacting legacy registries
 
 **--dns**=""
   Force Docker to use specific DNS servers
@@ -136,6 +146,9 @@ format.
 
 **--exec-root**=""
   Path to use as the root of the Docker execution state files. Default is `/var/run/docker`.
+
+**--experimental**=""
+  Enable the daemon experimental features.
 
 **--fixed-cidr**=""
   IPv4 subnet for fixed IPs (e.g., 10.20.0.0/16); this subnet must be nested in the bridge subnet (which is defined by \-b or \-\-bip)
@@ -160,6 +173,12 @@ unix://[/path/to/socket] to use.
 
 **--icc**=*true*|*false*
   Allow unrestricted inter\-container and Docker daemon host communication. If disabled, containers can still be linked together using the **--link** option (see **docker-run(1)**). Default is true.
+
+**--init**
+Run an init process inside containers for signal forwarding and process reaping.
+
+**--init-path**
+Path to the docker-init binary.
 
 **--insecure-registry**=[]
   Enable insecure registry communication, i.e., enable un-encrypted and/or untrusted communication.
@@ -230,10 +249,18 @@ output otherwise.
   Force the Docker runtime to use a specific storage driver.
 
 **--selinux-enabled**=*true*|*false*
-  Enable selinux support. Default is false. SELinux does not presently support either of the overlay storage drivers.
+  Enable selinux support. Default is false.
+
+**--shutdown-timeout**=*15*
+  Set the shutdown timeout value in seconds. Default is `15`.
 
 **--storage-opt**=[]
   Set storage driver options. See STORAGE DRIVER OPTIONS.
+
+**--swarm-default-advertise-addr**=*IP|INTERFACE*
+  Set default address or interface for swarm to advertise as its externally-reachable address to other cluster
+  members. This can be a hostname, an IP address, or an interface such as `eth0`. A port cannot be specified with
+  this option.
 
 **--tls**=*true*|*false*
   Use TLS; implied by --tlsverify. Default is false.
@@ -253,6 +280,9 @@ output otherwise.
 
 **--userland-proxy**=*true*|*false*
     Rely on a userland proxy implementation for inter-container and outside-to-container loopback communications. Default is true.
+
+**--userland-proxy-path**=""
+  Path to the userland proxy binary.
 
 **--userns-remap**=*default*|*uid:gid*|*user:group*|*user*|*uid*
     Enable user namespaces for containers on the daemon. Specifying "default" will cause a new user and group to be created to handle UID and GID range remapping for the user namespace mappings used for contained processes. Specifying a user (or uid) and optionally a group (or gid) will cause the daemon to lookup the user and group's subordinate ID ranges for use as the user namespace mappings for contained processes.
@@ -518,6 +548,21 @@ Engine daemon, grow the size of loop files and restart the daemon to resolve
 the issue.
 
 Example use:: `dockerd --storage-opt dm.min_free_space=10%`
+
+#### dm.xfs_nospace_max_retries
+
+Specifies the maximum number of retries XFS should attempt to complete
+IO when ENOSPC (no space) error is returned by underlying storage device.
+
+By default XFS retries infinitely for IO to finish and this can result
+in unkillable process. To change this behavior one can set
+xfs_nospace_max_retries to say 0 and XFS will not retry IO after getting
+ENOSPC and will shutdown filesystem.
+
+Example use:
+
+    $ sudo dockerd --storage-opt dm.xfs_nospace_max_retries=0
+
 
 ## ZFS options
 

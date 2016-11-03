@@ -1,39 +1,46 @@
-<!--[metadata]>
-+++
-title = "node ls"
-description = "The node ls command description and usage"
-keywords = ["node, list"]
-[menu.main]
-parent = "smn_cli"
-+++
-<![end-metadata]-->
+---
+title: "node ls"
+description: "The node ls command description and usage"
+keywords: ["node, list"]
+---
 
-**Warning:** this command is part of the Swarm management feature introduced in Docker 1.12, and might be subject to non backward-compatible changes.
+<!-- This file is maintained within the docker/docker Github
+     repository at https://github.com/docker/docker/. Make all
+     pull requests against that repo. If you see this file in
+     another repository, consider it read-only there, as it will
+     periodically be overwritten by the definitive file. Pull
+     requests which include edits to this file in other repositories
+     will be rejected.
+-->
 
 # node ls
 
-    Usage:  docker node ls [OPTIONS]
+```markdown
+Usage:  docker node ls [OPTIONS]
 
-    List nodes in the swarm
+List nodes in the swarm
 
-    Aliases:
-      ls, list
+Aliases:
+  ls, list
 
-    Options:
-      -f, --filter value   Filter output based on conditions provided
-          --help           Print usage
-      -q, --quiet          Only display IDs
+Options:
+  -f, --filter value   Filter output based on conditions provided
+      --help           Print usage
+  -q, --quiet          Only display IDs
+```
 
 Lists all the nodes that the Docker Swarm manager knows about. You can filter using the `-f` or `--filter` flag. Refer to the [filtering](#filtering) section for more information about available filter options.
 
 Example output:
 
-    $ docker node ls
-    ID                           NAME           MEMBERSHIP  STATUS  AVAILABILITY  MANAGER STATUS  LEADER
-    1bcef6utixb0l0ca7gxuivsj0    swarm-worker2   Accepted    Ready   Active
-    38ciaotwjuritcdtn9npbnkuz    swarm-worker1   Accepted    Ready   Active
-    e216jshn25ckzbvmwlnh5jr3g *  swarm-manager1  Accepted    Ready   Active        Reachable       Yes
+```bash
+$ docker node ls
 
+ID                           HOSTNAME        STATUS  AVAILABILITY  MANAGER STATUS
+1bcef6utixb0l0ca7gxuivsj0    swarm-worker2   Ready   Active
+38ciaotwjuritcdtn9npbnkuz    swarm-worker1   Ready   Active
+e216jshn25ckzbvmwlnh5jr3g *  swarm-manager1  Ready   Active        Leader
+```
 
 ## Filtering
 
@@ -45,7 +52,6 @@ The currently supported filters are:
 * name
 * id
 * label
-* desired_state
 
 ### name
 
@@ -53,18 +59,23 @@ The `name` filter matches on all or part of a node name.
 
 The following filter matches the node with a name equal to `swarm-master` string.
 
-    $ docker node ls -f name=swarm-manager1
-    ID                           NAME            MEMBERSHIP  STATUS  AVAILABILITY  MANAGER STATUS  LEADER
-    e216jshn25ckzbvmwlnh5jr3g *  swarm-manager1  Accepted    Ready   Active        Reachable       Yes
+```bash
+$ docker node ls -f name=swarm-manager1
+
+ID                           HOSTNAME        STATUS  AVAILABILITY  MANAGER STATUS
+e216jshn25ckzbvmwlnh5jr3g *  swarm-manager1  Ready   Active        Leader
+```
 
 ### id
 
 The `id` filter matches all or part of a node's id.
 
-    $ docker node ls -f id=1
-    ID                         NAME           MEMBERSHIP  STATUS  AVAILABILITY  MANAGER STATUS  LEADER
-    1bcef6utixb0l0ca7gxuivsj0  swarm-worker2  Accepted    Ready   Active
+```bash
+$ docker node ls -f id=1
 
+ID                         HOSTNAME       STATUS  AVAILABILITY  MANAGER STATUS
+1bcef6utixb0l0ca7gxuivsj0  swarm-worker2  Ready   Active
+```
 
 #### label
 
@@ -75,8 +86,9 @@ The following filter matches nodes with the `usage` label regardless of its valu
 
 ```bash
 $ docker node ls -f "label=foo"
-ID                         NAME           MEMBERSHIP  STATUS  AVAILABILITY  MANAGER STATUS  LEADER
-1bcef6utixb0l0ca7gxuivsj0  swarm-worker2  Accepted    Ready   Active
+
+ID                         HOSTNAME       STATUS  AVAILABILITY  MANAGER STATUS
+1bcef6utixb0l0ca7gxuivsj0  swarm-worker2  Ready   Active
 ```
 
 
@@ -84,5 +96,5 @@ ID                         NAME           MEMBERSHIP  STATUS  AVAILABILITY  MANA
 
 * [node inspect](node_inspect.md)
 * [node update](node_update.md)
-* [node tasks](node_tasks.md)
+* [node ps](node_ps.md)
 * [node rm](node_rm.md)

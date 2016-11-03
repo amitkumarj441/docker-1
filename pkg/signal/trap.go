@@ -1,13 +1,17 @@
 package signal
 
 import (
+	"fmt"
 	"os"
 	gosignal "os/signal"
+	"path/filepath"
 	"runtime"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/pkg/errors"
 )
 
 // Trap sets up a simplified signal "trap", appropriate for common
@@ -52,7 +56,7 @@ func Trap(cleanup func()) {
 						logrus.Info("Forcing docker daemon shutdown without cleanup; 3 interrupts received")
 					}
 				case syscall.SIGQUIT:
-					DumpStacks()
+					DumpStacks("")
 					logrus.Info("Forcing docker daemon shutdown without cleanup on SIGQUIT")
 				}
 				//for the SIGINT/TERM, and SIGQUIT non-clean shutdown case, exit with 128 + signal #
@@ -62,8 +66,11 @@ func Trap(cleanup func()) {
 	}()
 }
 
-// DumpStacks dumps the runtime stack.
-func DumpStacks() {
+const stacksLogNameTemplate = "goroutine-stacks-%s.log"
+
+// DumpStacks appends the runtime stack into file in dir and returns full path
+// to that file.
+func DumpStacks(dir string) (string, error) {
 	var (
 		buf       []byte
 		stackSize int
@@ -75,7 +82,15 @@ func DumpStacks() {
 		bufferLen *= 2
 	}
 	buf = buf[:stackSize]
-	// Note that if the daemon is started with a less-verbose log-level than "info" (the default), the goroutine
-	// traces won't show up in the log.
-	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
+	path := filepath.Join(dir, fmt.Sprintf(stacksLogNameTemplate, time.Now().Format(time.RFC3339)))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to open file to write the goroutine stacks")
+	}
+	defer f.Close()
+	if _, err := f.Write(buf); err != nil {
+		return "", errors.Wrap(err, "failed to write goroutine stacks")
+	}
+	f.Sync()
+	return path, nil
 }

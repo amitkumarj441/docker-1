@@ -1,20 +1,21 @@
-<!--[metadata]>
-+++
-title = "service ls"
-description = "The service ls command description and usage"
-keywords = ["service, ls"]
-[menu.main]
-parent = "smn_cli"
-+++
-<![end-metadata]-->
+---
+title: "service ls"
+description: "The service ls command description and usage"
+keywords: ["service, ls"]
+---
 
-**Warning:** this command is part of the Swarm management feature introduced in Docker 1.12, and might be subject to non backward-compatible changes.
+<!-- This file is maintained within the docker/docker Github
+     repository at https://github.com/docker/docker/. Make all
+     pull requests against that repo. If you see this file in
+     another repository, consider it read-only there, as it will
+     periodically be overwritten by the definitive file. Pull
+     requests which include edits to this file in other repositories
+     will be rejected.
+-->
 
 # service ls
 
 ```Markdown
-docker service ls --help
-
 Usage:	docker service ls [OPTIONS]
 
 List services
@@ -108,5 +109,5 @@ ID            NAME   REPLICAS  IMAGE        COMMAND
 * [service inspect](service_inspect.md)
 * [service rm](service_rm.md)
 * [service scale](service_scale.md)
-* [service tasks](service_tasks.md)
+* [service ps](service_ps.md)
 * [service update](service_update.md)

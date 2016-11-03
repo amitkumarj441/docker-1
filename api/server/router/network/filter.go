@@ -3,12 +3,10 @@ package network
 import (
 	"fmt"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/runconfig"
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/filters"
 )
-
-type filterHandler func([]types.NetworkResource, string) ([]types.NetworkResource, error)
 
 var (
 	// AcceptedFilters is an acceptable filters for validation
@@ -53,7 +51,7 @@ func filterNetworks(nws []types.NetworkResource, filter filters.Args) ([]types.N
 		return nil, err
 	}
 
-	var displayNet []types.NetworkResource
+	displayNet := []types.NetworkResource{}
 	for _, nw := range nws {
 		if filter.Include("driver") {
 			if !filter.ExactMatch("driver", nw.Driver) {

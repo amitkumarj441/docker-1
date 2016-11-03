@@ -7,6 +7,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 
+	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -79,7 +80,7 @@ func certSubjectFromContext(ctx context.Context) (pkix.Name, error) {
 
 // AuthorizeOrgAndRole takes in a context and a list of roles, and returns
 // the Node ID of the node.
-func AuthorizeOrgAndRole(ctx context.Context, org string, ou ...string) (string, error) {
+func AuthorizeOrgAndRole(ctx context.Context, org string, blacklistedCerts map[string]*api.BlacklistedCertificate, ou ...string) (string, error) {
 	certSubj, err := certSubjectFromContext(ctx)
 	if err != nil {
 		return "", err
@@ -87,18 +88,17 @@ func AuthorizeOrgAndRole(ctx context.Context, org string, ou ...string) (string,
 	// Check if the current certificate has an OU that authorizes
 	// access to this method
 	if intersectArrays(certSubj.OrganizationalUnit, ou) {
-		return authorizeOrg(ctx, org)
+		return authorizeOrg(certSubj, org, blacklistedCerts)
 	}
 
 	return "", grpc.Errorf(codes.PermissionDenied, "Permission denied: remote certificate not part of OUs: %v", ou)
 }
 
-// authorizeOrg takes in a context and an organization, and returns
+// authorizeOrg takes in a certificate subject and an organization, and returns
 // the Node ID of the node.
-func authorizeOrg(ctx context.Context, org string) (string, error) {
-	certSubj, err := certSubjectFromContext(ctx)
-	if err != nil {
-		return "", err
+func authorizeOrg(certSubj pkix.Name, org string, blacklistedCerts map[string]*api.BlacklistedCertificate) (string, error) {
+	if _, ok := blacklistedCerts[certSubj.CommonName]; ok {
+		return "", grpc.Errorf(codes.PermissionDenied, "Permission denied: node %s was removed from swarm", certSubj.CommonName)
 	}
 
 	if len(certSubj.Organization) > 0 && certSubj.Organization[0] == org {
@@ -112,9 +112,9 @@ func authorizeOrg(ctx context.Context, org string) (string, error) {
 // been proxied by a manager, in which case the manager is authenticated and
 // so is the certificate information that it forwarded. It returns the node ID
 // of the original client.
-func AuthorizeForwardedRoleAndOrg(ctx context.Context, authorizedRoles, forwarderRoles []string, org string) (string, error) {
+func AuthorizeForwardedRoleAndOrg(ctx context.Context, authorizedRoles, forwarderRoles []string, org string, blacklistedCerts map[string]*api.BlacklistedCertificate) (string, error) {
 	if isForwardedRequest(ctx) {
-		_, err := AuthorizeOrgAndRole(ctx, org, forwarderRoles...)
+		_, err := AuthorizeOrgAndRole(ctx, org, blacklistedCerts, forwarderRoles...)
 		if err != nil {
 			return "", grpc.Errorf(codes.PermissionDenied, "Permission denied: unauthorized forwarder role: %v", err)
 		}
@@ -122,7 +122,7 @@ func AuthorizeForwardedRoleAndOrg(ctx context.Context, authorizedRoles, forwarde
 		// This was a forwarded request. Authorize the forwarder, and
 		// check if the forwarded role matches one of the authorized
 		// roles.
-		forwardedID, forwardedOrg, forwardedOUs := forwardedTLSInfoFromContext(ctx)
+		_, forwardedID, forwardedOrg, forwardedOUs := forwardedTLSInfoFromContext(ctx)
 
 		if len(forwardedOUs) == 0 || forwardedID == "" || forwardedOrg == "" {
 			return "", grpc.Errorf(codes.PermissionDenied, "Permission denied: missing information in forwarded request")
@@ -140,7 +140,7 @@ func AuthorizeForwardedRoleAndOrg(ctx context.Context, authorizedRoles, forwarde
 	}
 
 	// There wasn't any node being forwarded, check if this is a direct call by the expected role
-	nodeID, err := AuthorizeOrgAndRole(ctx, org, authorizedRoles...)
+	nodeID, err := AuthorizeOrgAndRole(ctx, org, blacklistedCerts, authorizedRoles...)
 	if err == nil {
 		return nodeID, nil
 	}
@@ -178,6 +178,10 @@ type RemoteNodeInfo struct {
 	// ForwardedBy contains information for the node that forwarded this
 	// request. It is set to nil if the request was received directly.
 	ForwardedBy *RemoteNodeInfo
+
+	// RemoteAddr is the address that this node is connecting to the cluster
+	// from.
+	RemoteAddr string
 }
 
 // RemoteNode returns the node ID and role from the client's TLS certificate.
@@ -195,18 +199,30 @@ func RemoteNode(ctx context.Context) (RemoteNodeInfo, error) {
 		org = certSubj.Organization[0]
 	}
 
+	peer, ok := peer.FromContext(ctx)
+	if !ok {
+		return RemoteNodeInfo{}, grpc.Errorf(codes.PermissionDenied, "Permission denied: no peer info")
+	}
+
 	directInfo := RemoteNodeInfo{
 		Roles:        certSubj.OrganizationalUnit,
 		NodeID:       certSubj.CommonName,
 		Organization: org,
+		RemoteAddr:   peer.Addr.String(),
 	}
 
 	if isForwardedRequest(ctx) {
-		cn, org, ous := forwardedTLSInfoFromContext(ctx)
+		remoteAddr, cn, org, ous := forwardedTLSInfoFromContext(ctx)
 		if len(ous) == 0 || cn == "" || org == "" {
 			return RemoteNodeInfo{}, grpc.Errorf(codes.PermissionDenied, "Permission denied: missing information in forwarded request")
 		}
-		return RemoteNodeInfo{Roles: ous, NodeID: cn, Organization: org, ForwardedBy: &directInfo}, nil
+		return RemoteNodeInfo{
+			Roles:        ous,
+			NodeID:       cn,
+			Organization: org,
+			ForwardedBy:  &directInfo,
+			RemoteAddr:   remoteAddr,
+		}, nil
 	}
 
 	return directInfo, nil

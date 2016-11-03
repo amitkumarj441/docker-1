@@ -41,7 +41,7 @@ func newDriver(t testing.TB, name string, options []string) *Driver {
 		t.Fatal(err)
 	}
 
-	d, err := graphdriver.GetDriver(name, root, options, nil, nil)
+	d, err := graphdriver.GetDriver(name, root, options, nil, nil, nil)
 	if err != nil {
 		t.Logf("graphdriver: %v\n", err)
 		if err == graphdriver.ErrNotSupported || err == graphdriver.ErrPrerequisites || err == graphdriver.ErrIncompatibleFS {
@@ -197,12 +197,23 @@ func DriverTestDiffApply(t testing.TB, fileCount int, drivername string, driverO
 	defer PutDriver(t)
 	base := stringid.GenerateRandomID()
 	upper := stringid.GenerateRandomID()
+	deleteFile := "file-remove.txt"
+	deleteFileContent := []byte("This file should get removed in upper!")
+	deleteDir := "var/lib"
 
 	if err := driver.Create(base, "", "", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := addManyFiles(driver, base, fileCount, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := addFile(driver, base, deleteFile, deleteFileContent); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := addDirectory(driver, base, deleteDir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -213,6 +224,11 @@ func DriverTestDiffApply(t testing.TB, fileCount int, drivername string, driverO
 	if err := addManyFiles(driver, upper, fileCount, 6); err != nil {
 		t.Fatal(err)
 	}
+
+	if err := removeAll(driver, upper, deleteFile, deleteDir); err != nil {
+		t.Fatal(err)
+	}
+
 	diffSize, err := driver.DiffSize(upper, "")
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +240,10 @@ func DriverTestDiffApply(t testing.TB, fileCount int, drivername string, driverO
 	}
 
 	if err := checkManyFiles(driver, diff, fileCount, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkFile(driver, diff, deleteFile, deleteFileContent); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,7 +268,16 @@ func DriverTestDiffApply(t testing.TB, fileCount int, drivername string, driverO
 	if applyDiffSize != diffSize {
 		t.Fatalf("Apply diff size different, got %d, expected %d", applyDiffSize, diffSize)
 	}
+
 	if err := checkManyFiles(driver, diff, fileCount, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkFileRemoved(driver, diff, deleteFile); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkFileRemoved(driver, diff, deleteDir); err != nil {
 		t.Fatal(err)
 	}
 }

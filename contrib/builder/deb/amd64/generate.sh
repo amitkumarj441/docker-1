@@ -43,14 +43,14 @@ for version in "${versions[@]}"; do
 
 	if [ "$distro" = "debian" ]; then
 		cat >> "$version/Dockerfile" <<-'EOF'
-			# allow replacing httpredir mirror
-			ARG APT_MIRROR=httpredir.debian.org
-			RUN sed -i s/httpredir.debian.org/$APT_MIRROR/g /etc/apt/sources.list
+			# allow replacing httpredir or deb mirror
+			ARG APT_MIRROR=deb.debian.org
+			RUN sed -ri "s/(httpredir|deb).debian.org/$APT_MIRROR/g" /etc/apt/sources.list
 		EOF
 
 		if [ "$suite" = "wheezy" ]; then
 			cat >> "$version/Dockerfile" <<-'EOF'
-				RUN sed -i s/httpredir.debian.org/$APT_MIRROR/g /etc/apt/sources.list.d/backports.list
+				RUN sed -ri "s/(httpredir|deb).debian.org/$APT_MIRROR/g" /etc/apt/sources.list.d/backports.list
 			EOF
 		fi
 
@@ -81,7 +81,7 @@ for version in "${versions[@]}"; do
 	# packaging for "sd-journal.h" and libraries varies
 	case "$suite" in
 		precise|wheezy) ;;
-		sid|stretch|wily|xenial) packages+=( libsystemd-dev );;
+		sid|stretch|xenial) packages+=( libsystemd-dev );;
 		*) packages+=( libsystemd-journal-dev );;
 	esac
 

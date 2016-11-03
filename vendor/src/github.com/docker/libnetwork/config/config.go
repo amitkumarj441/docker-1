@@ -6,11 +6,13 @@ import (
 	"github.com/BurntSushi/toml"
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/discovery"
-	"github.com/docker/docker/pkg/tlsconfig"
+	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/docker/go-connections/tlsconfig"
 	"github.com/docker/libkv/store"
 	"github.com/docker/libnetwork/cluster"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/netlabel"
+	"github.com/docker/libnetwork/osl"
 )
 
 // Config encapsulates configurations of various Libnetwork components
@@ -19,6 +21,7 @@ type Config struct {
 	Cluster         ClusterCfg
 	Scopes          map[string]*datastore.ScopeCfg
 	ActiveSandboxes map[string]interface{}
+	PluginGetter    plugingetter.PluginGetter
 }
 
 // DaemonCfg represents libnetwork core configuration
@@ -194,6 +197,20 @@ func OptionDiscoveryAddress(address string) Option {
 func OptionDataDir(dataDir string) Option {
 	return func(c *Config) {
 		c.Daemon.DataDir = dataDir
+	}
+}
+
+// OptionExecRoot function returns an option setter for exec root folder
+func OptionExecRoot(execRoot string) Option {
+	return func(c *Config) {
+		osl.SetBasePath(execRoot)
+	}
+}
+
+// OptionPluginGetter returns a plugingetter for remote drivers.
+func OptionPluginGetter(pg plugingetter.PluginGetter) Option {
+	return func(c *Config) {
+		c.PluginGetter = pg
 	}
 }
 

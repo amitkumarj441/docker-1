@@ -51,7 +51,7 @@ var (
 	// greater than the 125 max.
 	ErrMaxDepthExceeded = errors.New("max depth exceeded")
 
-	// ErrNotSupported is used when the action is not supppoted
+	// ErrNotSupported is used when the action is not supported
 	// on the current platform
 	ErrNotSupported = errors.New("not support on this platform")
 )
@@ -83,6 +83,10 @@ type TarStreamer interface {
 // Layer represents a read-only layer
 type Layer interface {
 	TarStreamer
+
+	// TarStreamFrom returns a tar archive stream for all the layer chain with
+	// arbitrary depth.
+	TarStreamFrom(ChainID) (io.ReadCloser, error)
 
 	// ChainID returns the content hash of the entire layer chain. The hash
 	// chain is made up of DiffID of top layer and all of its parents.
@@ -170,6 +174,7 @@ type MountInit func(root string) error
 type Store interface {
 	Register(io.Reader, ChainID) (Layer, error)
 	Get(ChainID) (Layer, error)
+	Map() map[ChainID]Layer
 	Release(Layer) ([]Metadata, error)
 
 	CreateRWLayer(id string, parent ChainID, mountLabel string, initFunc MountInit, storageOpt map[string]string) (RWLayer, error)

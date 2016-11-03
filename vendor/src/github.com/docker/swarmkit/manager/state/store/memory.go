@@ -23,7 +23,6 @@ const (
 	indexID           = "id"
 	indexName         = "name"
 	indexServiceID    = "serviceid"
-	indexServiceMode  = "servicemode"
 	indexNodeID       = "nodeid"
 	indexSlot         = "slot"
 	indexCN           = "cn"
@@ -97,9 +96,14 @@ func NewMemoryStore(proposer state.Proposer) *MemoryStore {
 
 	return &MemoryStore{
 		memDB:    memDB,
-		queue:    watch.NewQueue(0),
+		queue:    watch.NewQueue(),
 		proposer: proposer,
 	}
+}
+
+// Close closes the memory store and frees its associated resources.
+func (s *MemoryStore) Close() error {
+	return s.queue.Close()
 }
 
 func fromArgs(args ...interface{}) ([]byte, error) {
@@ -236,7 +240,7 @@ func (s *MemoryStore) update(proposer state.Proposer, cb func(Tx) error) error {
 			sa, err = tx.changelistStoreActions()
 
 			if err == nil {
-				if sa != nil {
+				if len(sa) != 0 {
 					err = proposer.ProposeValue(context.Background(), sa, func() {
 						memDBTx.Commit()
 					})
@@ -346,7 +350,7 @@ func (batch *Batch) commit() error {
 		sa, batch.err = batch.tx.changelistStoreActions()
 
 		if batch.err == nil {
-			if sa != nil {
+			if len(sa) != 0 {
 				batch.err = batch.store.proposer.ProposeValue(context.Background(), sa, func() {
 					batch.tx.memDBTx.Commit()
 				})
@@ -574,6 +578,12 @@ func (tx readTx) findIterators(table string, by By, checkType func(By) error) ([
 		return []memdb.ResultIterator{it}, nil
 	case byIDPrefix:
 		it, err := tx.memDBTx.Get(table, indexID+prefix, string(v))
+		if err != nil {
+			return nil, err
+		}
+		return []memdb.ResultIterator{it}, nil
+	case byNamePrefix:
+		it, err := tx.memDBTx.Get(table, indexName+prefix, strings.ToLower(string(v)))
 		if err != nil {
 			return nil, err
 		}
